@@ -423,7 +423,8 @@ test('the band and the log show what Jev decided; the pane switches Jev routing 
   await after.unmount()
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /^running$/ })).toBeDefined()
+  expect(await pane.find({ text: /● running/ })).toBeDefined()
+  expect(await pane.find({ text: /Jev steered/ })).toBeDefined()
   expect(await pane.find({ text: /Bash/ })).toBeDefined()
   await pane.press({ key: 'routing' })
   expect(w.routingPosts).toEqual([`${GATEWAY}/dashboard/routing?enabled=false`])
@@ -520,6 +521,22 @@ test('the scene moves while a turn runs and holds still after it', async ($, on)
   await b.unmount()
 })
 
+test('a reinstall in a session the mod already routed runs its own gateway, not watch-only', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  // An earlier install left the session pointed at the mod's own gateway; the new one starts fresh.
+  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: GATEWAY }, up: true })
+  await start($)
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /jev-claude/ })).toBeUndefined()
+  expect(await pane.find({ key: 'restart' })).toBeDefined()
+  await pane.unmount()
+  // and direct means the API again, never the gateway it was left pointing at
+  w.gateway.up = false
+  await clock.advance(1_001)
+  await turn($, w, clock, 'hello', 1)
+  expect(w.sentTo).toEqual([undefined])
+})
+
 test('the pane shows the last turn and the switches on terminal and desktop', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
@@ -529,7 +546,7 @@ test('the pane shows the last turn and the switches on terminal and desktop', as
     const pane = await $.ui.mount({ plugin: 'jev', surface, component: 'Pane', requestId: 'jev', props: PANE_PROPS })
     expect(await pane.find({ text: /is it in prod\?/ })).toBeDefined()
     expect(await pane.find({ text: /through the gateway/ })).toBeDefined()
-    expect(await pane.find({ text: /can only send hints/ })).toBeDefined()
+    expect(await pane.find({ text: /switch Jev routing off/ })).toBeDefined()
     for (const key of ['route', 'routing', 'restart', 'report']) expect(await pane.find({ key })).toBeDefined()
     expect(await pane.find({ key: 'setup' })).toBeUndefined()
     await pane.unmount()

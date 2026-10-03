@@ -13,8 +13,12 @@ import {
   decisionText,
   emptyGatewayTurn,
   folderName,
+  cleanPrompt,
+  duration,
   isExcluded,
+  isOwnGateway,
   isValidKey,
+  latency,
   keyProvider,
   localGatewayOrigin,
   median,
@@ -24,6 +28,8 @@ import {
   reasonText,
   report,
   tallyGateway,
+  tokens,
+  toolCounts,
   upstreamFor,
 } from './logic'
 import type { GatewayEvent, GatewayProvider, GatewayTurn, LogRecord, Route, TurnRecord } from './logic'
@@ -287,7 +293,8 @@ async function guard($: $, turn: Turn | undefined): Promise<boolean> {
 /** The gateway stopped answering: requests go straight to the API until it is back. */
 async function fallBack($: $): Promise<void> {
   const g = await read($, gateway)
-  if (g.routed) await route($, false)
+  // Always: the session may point at the gateway without the mod having put it there (a reload, a reinstall).
+  await route($, false)
   // Already said, or a restart is under way and will say how it went.
   if (g.state === 'down' || g.state === 'starting') return
   await setGateway($, { state: 'down', note: managed ? 'not answering; it restarts on the next turn' : "jev-claude's gateway is not answering" })
@@ -310,8 +317,11 @@ function watch($: $): void {
  */
 async function configure($: $, cwd: string): Promise<void> {
   let saved = await read($, original)
-  if (!saved.saved) {
-    saved = { saved: true, value: (await $.env.get('ANTHROPIC_BASE_URL')) ?? null }
+  // A base URL at the mod's own gateway is one an earlier install left behind (a reinstall in
+  // the same session), not where the session really goes: its own default is the API.
+  if (!saved.saved || isOwnGateway(saved.value, port)) {
+    const value = (await $.env.get('ANTHROPIC_BASE_URL')) ?? null
+    saved = { saved: true, value: isOwnGateway(value, port) ? null : value }
     const first = saved
     await update($, original, () => first)
   }
@@ -345,6 +355,8 @@ async function configure($: $, cwd: string): Promise<void> {
   if (!(await isInstalled($))) return stay('not_installed', 'run /jev-setup to install it', value)
   if (!(await configuredKey($))) return stay('no_key', 'run /jev-setup to add a key for Jev', value)
   wanted = true
+  // Start from direct whatever the session was left pointing at; the guard routes the next request.
+  await route($, false)
   await setGateway($, { origin })
   await ensureStarted($)
   watch($)
@@ -642,6 +654,7 @@ async function publish($: $, record: TurnRecord): Promise<void> {
             reasons: g.reasons,
             picks: g.picks.map(p => p.tool),
             ...(g.jevMs.length > 0 ? { jevMs: median(g.jevMs) } : {}),
+            ...(g.cards?.length ? { cards: g.cards } : {}),
           },
         }
       : {}),
@@ -656,6 +669,8 @@ async function publish($: $, record: TurnRecord): Promise<void> {
       requests: s.requests + (g?.requests ?? 0),
       picked: s.picked + picked,
       fallbacks: s.fallbacks + (record.fallbacks ?? 0),
+      output: (s.output ?? 0) + (record.route === 'gateway' ? (record.actual.usage?.output ?? 0) : 0),
+      jevMs: g?.jevMs.length ? [...(s.jevMs ?? []), median(g.jevMs)].slice(-100) : (s.jevMs ?? []),
     }
   })
   await update($, decision, () => null)
@@ -664,138 +679,192 @@ async function publish($: $, record: TurnRecord): Promise<void> {
 
 // ------------------------------------------------------------ the pane
 
-function counts(m: Record<string, number>, label = (k: string) => k): string {
-  return Object.entries(m)
-    .sort((a, b) => b[1] - a[1])
-    .map(([key, n]) => `${label(key)} ${n}`)
-    .join(' · ')
-}
-
-function k(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
-}
-
-const STATE_TEXT: Record<string, { text: string; color?: string }> = {
-  off: { text: 'off in /config', color: 'gray' },
+const STATE_TEXT: Record<string, { text: string; color: string }> = {
+  off: { text: 'off', color: 'gray' },
   not_installed: { text: 'not installed', color: 'yellow' },
-  no_key: { text: 'no key for Jev', color: 'yellow' },
+  no_key: { text: 'needs a key', color: 'yellow' },
   starting: { text: 'starting', color: 'yellow' },
   up: { text: 'running', color: 'green' },
-  down: { text: 'down · requests go direct', color: 'red' },
-  excluded: { text: 'off in this repo (excluded)', color: 'gray' },
+  down: { text: 'down', color: 'red' },
+  excluded: { text: 'off in this repo', color: 'gray' },
   external: { text: "jev-claude's gateway", color: 'green' },
+}
+
+/** One cell per request: who decided it. */
+const CARD_CELL: Record<string, { cell: string; color?: string; dim?: boolean }> = {
+  pick: { cell: '■', color: 'cyan' },
+  direct: { cell: '■', color: 'green' },
+  pass: { cell: '·', dim: true },
+}
+
+const ROUTE_TEXT: Record<JevTurnView['route'], string> = {
+  gateway: 'through the gateway',
+  direct: 'direct',
+  down: 'direct · gateway was down',
+  excluded: 'excluded repo · direct',
+}
+
+function host(url: string | undefined): string {
+  return (url ?? '').replace(/^https?:\/\//, '').replace(/\/v1$/, '')
 }
 
 async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const g = await read($, gateway)
   const last = await read($, lastView)
+  const step = await read($, phase)
+  const d = await read($, decision)
   const session = { ...EMPTY_SESSION, ...(await read($, sessionView)) }
-  const state = STATE_TEXT[g.state] ?? { text: g.state }
+  const state = STATE_TEXT[g.state] ?? { text: g.state, color: 'gray' }
   const reachable = g.state === 'up' || g.state === 'external'
   const setUp = g.state === 'not_installed' || g.state === 'no_key'
+  const routing = g.routing !== false
+  const pct = (n: number, of: number) => (of > 0 ? ` (${Math.round((n / of) * 100)}%)` : '')
+  const label = (text: string) => <Text dimColor>{text.padEnd(16)}</Text>
+  const tile = (value: string, name: string, color?: string) => (
+    <Box flexDirection="column" marginRight={3}>
+      <Text bold color={color}>{value}</Text>
+      <Text dimColor>{name}</Text>
+    </Box>
+  )
+
+  const lg = last?.gateway
+  const cards = lg?.cards ?? []
+  const steered = lg ? [...PICK_MODES].reduce((n, m) => n + (lg.modes[m] ?? 0), 0) : 0
+  const sessionJev = session.jevMs?.length ? median(session.jevMs) : undefined
 
   return (
     <Box flexDirection="column">
-      <Text>
-        <Text bold>Jev</Text>
-        <Text dimColor> · jev-gateway {managed ? GATEWAY_VERSION : ''} · </Text>
-        <Text color={state.color}>{state.text}</Text>
-      </Text>
-      {g.note ? <Text dimColor wrap="wrap">{g.note}</Text> : null}
-      {origin && g.state !== 'off' && g.state !== 'excluded' && !setUp ? (
-        <Text wrap="wrap">
-          <Text dimColor>{origin} · this session </Text>
-          <Text color={g.routed ? 'green' : 'yellow'}>{g.paused ? 'paused (direct)' : g.routed ? 'through the gateway' : 'direct'}</Text>
-          {g.routing !== undefined ? (
-            <Text>
-              <Text dimColor> · Jev routing </Text>
-              <Text color={g.routing ? 'green' : 'yellow'}>{g.routing ? 'on' : 'off (baseline)'}</Text>
-            </Text>
-          ) : null}
-          {g.minConfidence !== undefined ? <Text dimColor> · acts at ≥ {g.minConfidence}</Text> : null}
+      {/* where things stand */}
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          <Text bold>Jev</Text>
+          <Text color={state.color}>  ● {state.text}</Text>
+          {reachable ? <Text color={routing ? 'cyan' : 'yellow'}>  {routing ? 'routing on' : 'routing off · baseline'}</Text> : null}
+        </Text>
+        <Text dimColor>{managed ? `gateway ${GATEWAY_VERSION}` : ''}</Text>
+      </Box>
+      {g.note ? <Text color={g.state === 'down' ? 'red' : 'yellow'} wrap="wrap">{g.note}</Text> : null}
+      {origin && reachable ? (
+        <Text dimColor wrap="truncate-end">
+          {host(origin)} → {host(upstream)} · acts at ≥ {g.minConfidence ?? 0.7}
+        </Text>
+      ) : null}
+      {wanted ? (
+        <Text wrap="truncate-end">
+          <Text dimColor>this session  </Text>
+          <Text color={g.paused ? 'yellow' : g.routed ? 'green' : 'red'}>{g.paused ? 'paused · goes direct' : g.routed ? 'through the gateway' : 'direct'}</Text>
         </Text>
       ) : null}
 
-      <Text> </Text>
-      <Text bold>Last turn</Text>
-      {last === null ? (
-        <Text dimColor>No turn yet.</Text>
-      ) : (
-        <Box flexDirection="column">
-          {last.prompt ? <Text dimColor wrap="truncate-end">"{last.prompt}"</Text> : null}
-          <Text dimColor wrap="truncate-end">
-            {last.route === 'gateway' ? 'through the gateway' : last.route === 'down' ? 'direct (gateway down)' : last.route === 'excluded' ? 'excluded repo' : 'direct'} · {last.steps} requests ·{' '}
-            {last.output !== undefined ? `${k(last.output)} output tokens · ` : ''}
-            {Math.round(last.durationMs / 1000)}s{last.fallbacks ? ` · ${last.fallbacks} went direct` : ''}
+      {/* the turn running now */}
+      {step ? (
+        <Box marginTop={1}>
+          <Text wrap="truncate-end">
+            <Text color="yellow">▶ now  </Text>
+            {d ? <Text color={cardFor(d.mode) === 'pass' ? undefined : 'cyan'} dimColor={cardFor(d.mode) === 'pass'}>{decisionText(d)}</Text> : <Text dimColor>{step.name === 'asking' ? 'Jev deciding…' : 'Claude working'}</Text>}
           </Text>
-          {last.gateway ? (
-            <Box flexDirection="column">
-              <Text wrap="wrap">
-                <Text dimColor>modes: </Text>
-                {counts(last.gateway.modes)}
-                {last.gateway.jevMs !== undefined ? <Text dimColor> · Jev p50 {last.gateway.jevMs}ms</Text> : null}
-              </Text>
-              {Object.keys(last.gateway.reasons).length > 0 ? (
-                <Text wrap="wrap">
-                  <Text dimColor>left to Claude: </Text>
-                  {counts(last.gateway.reasons, reasonText)}
-                </Text>
-              ) : null}
-              {last.gateway.picks.length > 0 ? (
-                <Text wrap="wrap">
-                  <Text dimColor>Jev picked: </Text>
-                  <Text color="cyan">{last.gateway.picks.slice(0, 10).join(', ')}</Text>
-                </Text>
-              ) : null}
-            </Box>
+        </Box>
+      ) : null}
+
+      {/* the last turn */}
+      <Box marginTop={1} flexDirection="column">
+        <Text>
+          <Text bold>Last turn</Text>
+          {last ? (
+            <Text dimColor>
+              {'  '}
+              {duration(last.durationMs)} · {lg?.requests ?? last.steps} requests{last.output !== undefined ? ` · ${tokens(last.output)} out` : ''}
+            </Text>
           ) : null}
+        </Text>
+        {last === null ? (
+          <Text dimColor>No turn yet. Send a prompt and Jev's decisions show up here.</Text>
+        ) : (
+          <Box flexDirection="column">
+            {last.prompt ? <Text dimColor italic wrap="truncate-end">“{cleanPrompt(last.prompt)}”</Text> : null}
+            {last.route !== 'gateway' || last.fallbacks ? (
+              <Text color={last.route === 'down' || last.fallbacks ? 'red' : undefined} dimColor={last.route !== 'down' && !last.fallbacks}>
+                {ROUTE_TEXT[last.route]}{last.fallbacks ? ` · ${last.fallbacks} request(s) went direct` : ''}
+              </Text>
+            ) : null}
+            {lg ? (
+              <Box flexDirection="column" marginTop={1}>
+                {cards.length > 0 ? (
+                  <Text wrap="wrap">
+                    {cards.map(c => {
+                      const cell = CARD_CELL[c] ?? CARD_CELL.pass!
+                      return <Text color={cell.color} dimColor={cell.dim}>{cell.cell}</Text>
+                    })}
+                  </Text>
+                ) : null}
+                <Text>
+                  {label('Jev steered')}
+                  <Text color="cyan" bold>{steered}</Text>
+                  <Text dimColor> of {lg.requests}{pct(steered, lg.requests)}</Text>
+                </Text>
+                {lg.picks.length > 0 ? (
+                  <Text wrap="wrap">
+                    {label('picked')}
+                    <Text color="cyan">{toolCounts(lg.picks)}</Text>
+                  </Text>
+                ) : null}
+                {Object.keys(lg.reasons).length > 0 ? (
+                  <Text wrap="wrap">
+                    {label('left to Claude')}
+                    <Text>
+                      {Object.entries(lg.reasons)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([r, n]) => `${reasonText(r)} ${n}`)
+                        .join(' · ')}
+                    </Text>
+                  </Text>
+                ) : null}
+                {lg.jevMs !== undefined ? (
+                  <Text>
+                    {label('Jev latency')}
+                    <Text color={lg.jevMs > 1000 ? 'yellow' : undefined}>{latency(lg.jevMs)}</Text>
+                    <Text dimColor> per request, before Claude starts</Text>
+                  </Text>
+                ) : null}
+              </Box>
+            ) : null}
+          </Box>
+        )}
+      </Box>
+
+      {/* the session */}
+      <Box marginTop={1} flexDirection="column">
+        <Text bold>This session</Text>
+        <Box flexDirection="row" flexWrap="wrap">
+          {tile(String(session.turns), 'turns')}
+          {tile(String(session.requests), 'requests')}
+          {tile(`${session.picked}${pct(session.picked, session.requests)}`, 'Jev steered', 'cyan')}
+          {session.output ? tile(tokens(session.output), 'output') : null}
+          {sessionJev !== undefined ? tile(latency(sessionJev), 'Jev p50', sessionJev > 1000 ? 'yellow' : undefined) : null}
+          {session.fallbacks > 0 ? tile(String(session.fallbacks), 'went direct', 'red') : null}
         </Box>
-      )}
+      </Box>
 
-      <Text> </Text>
-      <Text bold>This session</Text>
-      <Text dimColor wrap="wrap">
-        {session.turns} turns · {session.routed} through the gateway · {session.requests} requests seen · Jev chose the tool on {session.picked}
-        {session.fallbacks > 0 ? ` · ${session.fallbacks} went direct while it was down` : ''}
-      </Text>
+      <Box marginTop={1}>
+        <Text dimColor wrap="wrap">
+          {last === null
+            ? "Jev picks the tool that fits each request; the gateway passes it to Claude as a hint (with thinking on, it can't force one). To see if it helps, switch Jev routing off for similar work, then /jev-report."
+            : routing
+              ? 'Measure it: switch Jev routing off for some similar work, then /jev-report compares the two.'
+              : 'Baseline: Jev is not asked. Switch routing back on to compare in /jev-report.'}
+        </Text>
+      </Box>
 
-      <Text> </Text>
-      <Text dimColor wrap="wrap">
-        The gateway asks Jev on every request and steers Claude only when Jev is confident. With thinking on (Claude Code's default for Opus) it can only send hints. Results depend on the model and the task: switch Jev routing off for some similar work, then compare with /jev-report.
-      </Text>
-
-      <Text> </Text>
-      <Box flexDirection="row" flexWrap="wrap">
-        {setUp ? (
-          <Box marginRight={1}>
-            <Button key="setup" hotkey="s" variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} />
-          </Box>
-        ) : null}
-        {wanted ? (
-          <Box marginRight={1}>
-            <Button key="route" hotkey="p" label={g.paused ? 'resume routing' : 'pause routing'} onPress={() => setPaused($, !g.paused)} />
-          </Box>
-        ) : null}
-        {reachable ? (
-          <Box marginRight={1}>
-            <Button key="routing" hotkey="g" label={`Jev routing: ${g.routing === false ? 'off' : 'on'}`} onPress={() => setRouting($, g.routing === false)} />
-          </Box>
-        ) : null}
-        {wanted && managed ? (
-          <Box marginRight={1}>
-            <Button key="restart" hotkey="x" label="restart gateway" onPress={() => restart($)} />
-          </Box>
-        ) : null}
-        {reachable ? (
-          <Box marginRight={1}>
-            <Button key="dashboard" hotkey="d" label="copy dashboard URL" onPress={press => void $.ui.copy({ text: `${origin}/dashboard`, surface: press.surface })} />
-          </Box>
-        ) : null}
-        <Box marginRight={1}>
-          <Button key="report" hotkey="r" label="report (7 days)" onPress={() => void $.command.run({ command: 'jev-report', args: '' })} />
-        </Box>
-        <Button key="close" role="dismiss" label="close" onPress={() => $.ui.close({ id: PANE })} />
+      <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {setUp ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
+        {wanted ? <Button key="route" hotkey="p" plain label={g.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !g.paused)} /> : null}
+        {reachable ? <Button key="routing" hotkey="g" plain label={routing ? 'routing off' : 'routing on'} onPress={() => setRouting($, !routing)} /> : null}
+        {wanted && managed ? <Button key="restart" hotkey="x" plain label="restart" onPress={() => restart($)} /> : null}
+        {reachable ? <Button key="dashboard" hotkey="d" plain label="copy dashboard" onPress={press => void $.ui.copy({ text: `${origin}/dashboard`, surface: press.surface })} /> : null}
+        <Button key="report" hotkey="r" plain label="report" onPress={() => void $.command.run({ command: 'jev-report', args: '' })} />
+        {/* the terminal's pane has its own ✕ */}
+        {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
     </Box>
   )

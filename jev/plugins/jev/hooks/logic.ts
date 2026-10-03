@@ -138,10 +138,12 @@ export type GatewayTurn = {
   baseline: number
   output: number
   jevMs: number[]
+  /** Who decided each request, in order: the pane's trail (absent in logs from before 0.4.3). */
+  cards?: DecisionCard[]
 }
 
 export function emptyGatewayTurn(): GatewayTurn {
-  return { requests: 0, modes: {}, reasons: {}, picks: [], baseline: 0, output: 0, jevMs: [] }
+  return { requests: 0, modes: {}, reasons: {}, picks: [], baseline: 0, output: 0, jevMs: [], cards: [] }
 }
 
 export function tallyGateway(turn: GatewayTurn, event: GatewayEvent): void {
@@ -156,6 +158,8 @@ export function tallyGateway(turn: GatewayTurn, event: GatewayEvent): void {
     turn.picks.push({ tool: event.tool, confidence: event.confidence ?? event.jev?.confidence ?? 0, mode: event.mode })
   }
   if (event.jev && turn.jevMs.length < 100) turn.jevMs.push(event.jev.latencyMs)
+  const cards = (turn.cards ??= [])
+  if (cards.length < 200) cards.push(cardFor(event.mode))
   turn.output += event.usage?.output ?? 0
 }
 
@@ -285,6 +289,48 @@ export function isValidKey(key: string): boolean {
 /** The last folder name of a path, on any platform. */
 export function folderName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path
+}
+
+/**
+ * Whether a base URL points at the gateway this mod runs on `port`: one an earlier install of the
+ * mod left in the environment, not one jev-claude started.
+ */
+export function isOwnGateway(baseUrl: string | null | undefined, port: number): boolean {
+  const origin = localGatewayOrigin(baseUrl)
+  return origin !== undefined && Number(origin.split(':').pop()) === port
+}
+
+// ---------------------------------------------------------------- formatting for the pane
+
+/** A prompt as one clean line: pasted-image markers and runs of whitespace gone. */
+export function cleanPrompt(text: string): string {
+  return text.replace(/\[(?:Image|Pasted text) #\d+[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** `Read ×3 · Bash ×2`: the tools Jev picked, most picked first. */
+export function toolCounts(picks: readonly string[]): string {
+  const m = new Map<string, number>()
+  for (const t of picks) m.set(t, (m.get(t) ?? 0) + 1)
+  return [...m.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([t, n]) => (n > 1 ? `${t} ×${n}` : t))
+    .join(' · ')
+}
+
+/** `55s`, `5m 17s`. */
+export function duration(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
+}
+
+/** `840`, `23.6k`, `1.2M`. */
+export function tokens(n: number): string {
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+}
+
+/** `640ms`, `1.7s`. */
+export function latency(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
 /** `http://127.0.0.1:8789` from a base URL that points at a gateway on this machine, else undefined. */

@@ -2,11 +2,15 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   cardFor,
+  cleanPrompt,
   decisionText,
+  duration,
   emptyGatewayTurn,
   folderName,
   isExcluded,
+  isOwnGateway,
   isValidKey,
+  latency,
   keyProvider,
   localGatewayOrigin,
   nodeVersionOk,
@@ -14,6 +18,8 @@ import {
   reasonText,
   report,
   tallyGateway,
+  tokens,
+  toolCounts,
   upstreamFor,
 } from '../hooks/logic'
 import type { GatewayTurn, LogRecord, TurnRecord } from '../hooks/logic'
@@ -49,7 +55,29 @@ describe("the gateway's decisions", () => {
       baseline: 1,
       output: 50,
       jevMs: [240],
+      cards: ['pick', 'pass', 'pass'],
     })
+  })
+})
+
+describe('the pane', () => {
+  test('formats what it shows', () => {
+    expect(cleanPrompt('[Image #3] I want an empty line\n\n  above')).toBe('I want an empty line above')
+    expect(toolCounts(['Read', 'Bash', 'Read', 'Bash', 'Read', 'Grep'])).toBe('Read ×3 · Bash ×2 · Grep')
+    expect(duration(55_000)).toBe('55s')
+    expect(duration(317_000)).toBe('5m 17s')
+    expect(tokens(23_600)).toBe('23.6k')
+    expect(tokens(840)).toBe('840')
+    expect(latency(640)).toBe('640ms')
+    expect(latency(1732)).toBe('1.7s')
+  })
+
+  test("tells the mod's own gateway from jev-claude's", () => {
+    expect(isOwnGateway('http://127.0.0.1:8794', 8794)).toBe(true)
+    expect(isOwnGateway('http://localhost:8794/', 8794)).toBe(true)
+    expect(isOwnGateway('http://127.0.0.1:8789', 8794)).toBe(false)
+    expect(isOwnGateway('https://api.anthropic.com', 8794)).toBe(false)
+    expect(isOwnGateway(null, 8794)).toBe(false)
   })
 })
 

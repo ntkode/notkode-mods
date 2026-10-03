@@ -6,7 +6,15 @@ export type JevTurnView = {
   durationMs: number
   output?: number
   fallbacks?: number
-  gateway?: { requests: number; modes: Record<string, number>; reasons: Record<string, number>; picks: string[]; jevMs?: number }
+  gateway?: {
+    requests: number
+    modes: Record<string, number>
+    reasons: Record<string, number>
+    picks: string[]
+    jevMs?: number
+    /** Who decided each request, in order: `pick`, `direct` or `pass`. */
+    cards?: string[]
+  }
 }
 
 /** This session's running totals. */
@@ -16,6 +24,10 @@ export type JevSessionView = {
   requests: number
   picked: number
   fallbacks: number
+  /** Output tokens of the routed turns. */
+  output?: number
+  /** Jev's median latency per turn, newest last. */
+  jevMs?: number[]
 }
 
 /**
