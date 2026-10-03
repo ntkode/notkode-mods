@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "notkode-mods",
+  "description": "Claude Code plugins and mods by Notkode",
+  "owner": {
+    "name": "Notkode"
+  },
+  "plugins": [
+    {
+      "name": "jev",
+      "description": "Runs jev-gateway from inside Claude Code: Jev picks the next tool on each request, shown live and measured against a baseline",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/tone-lotto/jevMod.git",
+        "path": "plugins/jev",
+        "ref": "main"
+      },
+      "category": "productivity",
+      "keywords": ["jev", "typesafe", "jev-gateway", "tool-routing", "mod"]
+    }
+  ]
+}
