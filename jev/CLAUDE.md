@@ -7,7 +7,7 @@ state and the next steps.
 
 ## Layout
 
-- `.claude-plugin/marketplace.json`: the marketplace (`jevmod`), so users can install with `/plugin install jev@jevmod`
+- Distribution: the [notkode-mods](https://github.com/ntkode/notkode-mods) marketplace lists `plugins/jev` (a `git-subdir` entry), so users install with `/plugin install jev@notkode-mods`. This repo has no marketplace of its own.
 - `plugins/jev/`: the plugin
   - `.claude-plugin/plugin.json`: manifest and `userConfig` (the `/config` rows)
   - `hooks/register.tsx`: the hooks module (`register(on, options)`)
@@ -44,7 +44,7 @@ Grep it for the event or noun at hand rather than guessing.
 - `$.env.set('ANTHROPIC_BASE_URL', …)` reroutes the session's next model request (proven).
   Never point it at something that isn't answering.
 - `command.run` output text is read by the model too: never put secrets in it.
-- Options are stored per install key: `jev@inline` for `--plugin-dir`, `jev@jevmod` for the
+- Options are stored per install key: `jev@inline` for `--plugin-dir`, `jev@notkode-mods` for the
   marketplace install. Settings under one never reach the other.
 - `mock.env` answers `env.get` only: a test of code that calls `$.env.set` hooks `env.get` and
   `env.set` over one object itself. A `tool.call` carries the tool's arguments at the top level

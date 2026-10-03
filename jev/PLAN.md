@@ -5,7 +5,8 @@ the end of the session that finished v0.4.
 
 ## The decision
 
-jevMod is a **standalone, open-source Claude Code plugin** (marketplace `jevmod`, plugin `jev`).
+jevMod is a **standalone, open-source Claude Code plugin** (`jev`), distributed through the
+[notkode-mods](https://github.com/ntkode/notkode-mods) marketplace with the other Notkode plugins.
 
 1. **First feature: run [jev-gateway](https://github.com/vinilana/jev-gateway) from inside Claude Code.**
    The gateway asks Jev which tool fits on every model request and steers Claude when Jev is
@@ -21,7 +22,7 @@ version itself, versions can't drift apart.
 
 ## Current state: v0.4 works, not released
 
-`claude plugin validate` passes (plugin and marketplace), `claude plugin test` passes 33 of 33,
+`claude plugin validate` passes, `claude plugin test` passes 33 of 33,
 and `tsc` is clean. On macOS it has been run for real, headless and interactive, against
 jev-gateway 0.5.0 with an OpenRouter key.
 
@@ -71,9 +72,11 @@ jev-gateway 0.5.0 with an OpenRouter key.
 - [x] Excluded repo: nothing started, the request went direct, and the log kept no prompt.
 - [x] **Interactive** session (tmux): band "Jev picked Read 0.99 (hint)" mid-turn; pane correct;
       gateway killed while idle → watchdog let go, the next turn went direct and restarted it.
-- [x] Marketplace install (`claude plugin marketplace add <repo>` + `claude plugin install
-      jev@jevmod`, in an isolated `CLAUDE_CONFIG_DIR`) loads the hooks module like `--plugin-dir`:
-      the gateway started from that install alone.
+- [x] Marketplace install loads the hooks module like `--plugin-dir`: the gateway started from
+      that install alone (isolated `CLAUDE_CONFIG_DIR`).
+- [x] From GitHub, as users will: `/plugin marketplace add ntkode/notkode-mods` +
+      `/plugin install jev@notkode-mods` installs `plugins/jev` from this repo (private repos
+      both; git used the `gh` login over https).
 - [x] Licence: jev-gateway is MIT (package and LICENSE); jevMod is MIT.
 
 ## Still open before release
@@ -81,8 +84,8 @@ jev-gateway 0.5.0 with an OpenRouter key.
 - [ ] **Windows.** Untested. Designed for it: `node` with no shell, the gateway's own launcher
       (cross-platform), `npm` → `npm.cmd` → `cmd /c npm`, `USERPROFILE` fallback, PowerShell
       clipboard, backslash paths in exclusions. Needs one real run.
-- [ ] **Publish the repository** (`github.com/tone-lotto/jevMod` does not exist yet), so
-      `/plugin marketplace add tone-lotto/jevMod` works.
+- [ ] **Make both repositories public** (`tone-lotto/jevMod` and `ntkode/notkode-mods` are
+      private for now).
 - [ ] `/jev-setup` itself driven end to end on a clean machine (its parts ran for real: npm
       install, launcher, save-key's gateway code; the dialog flow ran in tests only).
 - [ ] Linux clipboard (`wl-paste`, `xclip`) untested.
@@ -93,7 +96,7 @@ jev-gateway 0.5.0 with an OpenRouter key.
   concurrent sessions count each other's requests.
 - The launcher's pid and log files are per client, not per port: `jev-claude --stop` can stop the
   plugin's gateway (it restarts on the next turn). Upstream fix drafted.
-- Options are per install key (`jev@inline` vs `jev@jevmod`): excluded repos must be set again
+- Options are per install key (`jev@inline` vs `jev@notkode-mods`): excluded repos must be set again
   after switching from `--plugin-dir` to the marketplace install.
 - No unload event: uninstalling mid-session leaves the session pointed at the gateway until the
   session ends.
@@ -101,7 +104,7 @@ jev-gateway 0.5.0 with an OpenRouter key.
 ## Next steps, in order
 
 1. Run it on Windows once; fix what breaks.
-2. Publish the repository; install from GitHub on a second machine; drive `/jev-setup` there.
+2. Make both repositories public; install on a second machine; drive `/jev-setup` there.
 3. Open the issues drafted in `research/upstream/jev-gateway.md` (README link, per-port pid/log
    files, fast-lane proposal).
 4. Use it: switch Jev routing off for some similar work and read `/jev-report` once both groups

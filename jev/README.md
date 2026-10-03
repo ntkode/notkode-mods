@@ -37,21 +37,18 @@ plugin measures it on your work rather than promising savings, with one switch t
 You need Claude Code with plugin function hooks (mods), Node.js 22.15 or newer on your `PATH`,
 and an API key for Jev from OpenRouter, TypeSafe, OpenCode or Vercel AI Gateway.
 
-From GitHub (once the repository is public):
+It is part of the [notkode-mods](https://github.com/ntkode/notkode-mods) marketplace. In Claude
+Code:
 
 ```
-/plugin marketplace add tone-lotto/jevMod
-/plugin install jev@jevmod
+/plugin marketplace add ntkode/notkode-mods
+/plugin install jev@notkode-mods
 ```
 
-From a local clone:
+To work on the plugin itself, run a clone instead: `claude --plugin-dir path/to/jevMod/plugins/jev`
+(the folder hot-reloads on save).
 
-```
-/plugin marketplace add ~/path/to/jevMod
-/plugin install jev@jevmod
-```
-
-Then, in Claude Code:
+Then:
 
 ```
 /jev-setup
@@ -83,7 +80,7 @@ In `/config`, under the plugin:
 | Jev: gateway port | `8794` | where the plugin runs its gateway (127.0.0.1 only) |
 | Jev: excluded repos | empty | comma-separated folder names never routed through the gateway |
 
-Options are stored per install: a marketplace install (`jev@jevmod`) and a `--plugin-dir` copy
+Options are stored per install: a marketplace install (`jev@notkode-mods`) and a `--plugin-dir` copy
 (`jev@inline`) each keep their own. **Set your excluded repos again after switching.**
 
 ## Good to know
