@@ -497,19 +497,21 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
     g.state === 'starting' ? 'Jev starting the gateway…' : g.paused ? 'Jev paused · this session goes direct' : `Jev not set up · ${g.note ?? 'run /jev-setup'}`
   const lines: Record<Scene, RenderElement> = {
     unset: <Text dimColor>{unset}</Text>,
-    idle: <Text dimColor>Jev waiting · {g.routing === false ? 'routing off (baseline)' : 'routing tools'}</Text>,
+    // At rest between turns; the routing switch is a standing setting, not something under way.
+    idle: <Text dimColor>Jev idle · {g.routing === false ? 'routing off (baseline)' : 'routing on'}</Text>,
     asking: <Text color="yellow">Jev deciding…</Text>,
     answering: during,
     working: during,
     error: <Text color="red">gateway down · direct</Text>,
   }
 
-  if (e.surface === 'terminal' && e.props.maxRows >= SCENE_ROWS) {
+  // The scene, with an empty line above it to set it apart from the transcript.
+  if (e.surface === 'terminal' && e.props.maxRows >= SCENE_ROWS + 1) {
     const { Raster } = $.ui.resolve(e)
     bandSite = e.requestId
     const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark))
     return (
-      <Box flexDirection="row">
+      <Box flexDirection="row" marginTop={1}>
         <Raster key="jev-scene" columns={art.columns} rows={art.rows} cells={art.cells} />
         <Box marginLeft={2}>{lines[now.scene]}</Box>
       </Box>

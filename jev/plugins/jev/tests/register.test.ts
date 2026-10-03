@@ -198,7 +198,7 @@ test('starts the gateway at session start and routes the session through it from
   expect(w.runs.find(r => r.argv[2] === '--start')!.env).toEqual({ JEV_CLAUDE_PORT: '8794', JEV_CLAUDE_UPSTREAM_BASE_URL: 'https://api.anthropic.com/v1' })
   const idle = await band($)
   expect(await idle.find({ type: 'Raster' })).toBeDefined()
-  expect(await idle.find({ text: /Jev waiting · routing tools/ })).toBeDefined()
+  expect(await idle.find({ text: /Jev idle · routing on/ })).toBeDefined()
   await idle.unmount()
 
   await turn($, w, clock, 'why does the test fail?', 2)
@@ -416,7 +416,7 @@ test('the band and the log show what Jev decided; the pane switches Jev routing 
   expect(record.gateway.modes).toEqual({ hint: 1, passthrough: 1 })
   expect(record.gateway.picks[0].tool).toBe('Bash')
   const after = await band($)
-  expect(await after.find({ text: /Jev waiting/ })).toBeDefined()
+  expect(await after.find({ text: /Jev idle/ })).toBeDefined()
   await after.unmount()
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
@@ -441,7 +441,7 @@ test('a reload mid-turn does not leave the band stuck', async ($, on) => {
   await start($) // what a hot reload fires: the turn in flight is gone with the old module
   const b = await band($)
   expect(await b.find({ text: /Jev deciding/ })).toBeUndefined()
-  expect(await b.find({ text: /Jev waiting/ })).toBeDefined()
+  expect(await b.find({ text: /Jev idle/ })).toBeDefined()
   await b.unmount()
 })
 

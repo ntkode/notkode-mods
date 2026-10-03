@@ -5,7 +5,7 @@ Add new ones at the bottom with a source link.
 
 | # | Idea | Source | Status | Result |
 |---|---|---|---|---|
-| 1 | **Run jev-gateway from inside Claude Code**: Jev picks the next tool on each request | [vinilana/jev-gateway](https://github.com/vinilana/jev-gateway) | **Built (v0.4)**; next: live, routing on vs off per user (`/jev-report`) | Routing proven, headless and interactive: [04](results/04-routing-a-session-through-jev-gateway.md) |
+| 1 | **Run jev-gateway from inside Claude Code**: Jev picks the next tool on each request | [vinilana/jev-gateway](https://github.com/vinilana/jev-gateway) | **Built (v0.4)**; next: live, routing on vs off per user (`/jev-report`) | Routing proven: [04](results/04-routing-a-session-through-jev-gateway.md); Opus 5.5 pilot, ~20% fewer requests: [06](results/06-benchmark-opus-5-5-pilot.md) |
 | 2 | Fast lane: low effort for quick status questions | own analysis | Proven, small; propose upstream | [02](results/02-fast-lane-cross-check.md) |
 | 3 | Effort router: lower "routine", raise "hard" | own analysis | Dropped | [01](results/01-four-features.md) |
 | 4 | Per-turn tool and skill router | own analysis | Dropped (gateway does it per request, better) | [01](results/01-four-features.md) |
