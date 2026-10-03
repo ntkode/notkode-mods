@@ -1,0 +1,43 @@
+{
+  "name": "jev",
+  "version": "0.4.0",
+  "description": "Runs jev-gateway for Claude Code from inside the session: Jev picks the next tool on each request, shown live, measured against a baseline",
+  "author": {
+    "name": "Matheus Tonelotto"
+  },
+  "homepage": "https://github.com/tone-lotto/jevMod",
+  "repository": "https://github.com/tone-lotto/jevMod",
+  "license": "MIT",
+  "keywords": [
+    "jev",
+    "typesafe",
+    "jev-gateway",
+    "tool-routing",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "gateway": {
+      "type": "string",
+      "title": "Jev: route through jev-gateway",
+      "description": "on: the mod starts jev-gateway and sends this session's model requests through it (straight to the API again the moment it stops answering). off: requests go straight to the API.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "port": {
+      "type": "number",
+      "title": "Jev: gateway port",
+      "description": "The local port the mod runs jev-gateway on (127.0.0.1 only).",
+      "default": 8794
+    },
+    "excludedRepos": {
+      "type": "string",
+      "title": "Jev: excluded repos",
+      "description": "Comma-separated folder names. Sessions in these folders never go through the gateway, so their conversations are not sent to Jev.",
+      "default": ""
+    }
+  }
+}

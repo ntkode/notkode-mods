@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jevmod",
+  "description": "Jev (TypeSafe's fast decision model) inside Claude Code",
+  "owner": {
+    "name": "Matheus Tonelotto"
+  },
+  "plugins": [
+    {
+      "name": "jev",
+      "description": "Runs jev-gateway from inside Claude Code: Jev picks the next tool on each request, shown live and measured against a baseline",
+      "author": {
+        "name": "Matheus Tonelotto"
+      },
+      "source": "./plugins/jev",
+      "category": "productivity",
+      "keywords": ["jev", "typesafe", "jev-gateway", "tool-routing", "mod"]
+    }
+  ]
+}
