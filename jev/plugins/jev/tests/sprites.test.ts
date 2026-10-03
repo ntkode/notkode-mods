@@ -34,6 +34,32 @@ describe('the scene follows the request', () => {
     expect(where('working', COLORS.pick, 0, 'none')).toBe(-1)
   })
 
+  test('streaming: two lanes flow from Jev to Claude on every frame, never a blank middle', () => {
+    const cols = (frame: number, color: number) => {
+      const out: number[] = []
+      scenePixels('streaming', 'none', frame).forEach(row => row.forEach((p, c) => p === color && c >= MIDDLE[0] && c <= MIDDLE[1] && out.push(c)))
+      return out
+    }
+    for (let f = 0; f < 12; f++) {
+      expect(cols(f, COLORS.packet).length).toBeGreaterThan(0)
+      expect(cols(f, COLORS.stream).length).toBeGreaterThan(0)
+    }
+    // each dot moves one pixel left per frame (towards Claude)
+    const shifted = cols(1, COLORS.packet).map(c => c + 1)
+    for (const c of shifted.filter(c => c <= MIDDLE[1])) expect(cols(0, COLORS.packet)).toContain(c)
+  })
+
+  test('working with no decision yet still shows a trail between them', () => {
+    expect(where('working', COLORS.trail, 0, 'none')).toBeGreaterThan(-1)
+  })
+
+  test('routing off: the owl sleeps, eyes shut, in every scene but down', () => {
+    const pupils = (scene: Parameters<typeof scenePixels>[0], asleep: boolean) => scenePixels(scene, 'none', 0, false, asleep).flatMap(r => r.slice(18)).filter(p => p === COLORS.pupil).length
+    expect(pupils('idle', false)).toBeGreaterThan(0)
+    expect(pupils('idle', true)).toBe(0)
+    expect(pupils('streaming', true)).toBe(0)
+  })
+
   test("down: the owl's eye turns red", () => {
     expect(scenePixels('error').flat().includes(COLORS.error)).toBe(true)
     expect(scenePixels('idle').flat().includes(COLORS.error)).toBe(false)

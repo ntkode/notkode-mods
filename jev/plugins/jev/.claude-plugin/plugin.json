@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Runs jev-gateway for Claude Code from inside the session: Jev picks the next tool on each request, shown live, measured against a baseline",
   "author": {
     "name": "Matheus Tonelotto"

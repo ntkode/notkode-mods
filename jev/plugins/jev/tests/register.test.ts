@@ -27,6 +27,8 @@ type World = {
   answers: string[]
   gateway: { at: string; up: boolean; startable: boolean; routing: boolean; startedAt: string; upstream?: string; events: Record<string, unknown>[] }
   routingPosts: string[]
+  /** While set, a model request stays in flight until it resolves. */
+  hold?: Promise<void>
 }
 
 type Setup = { installed?: boolean; key?: boolean; env?: Record<string, string>; gatewayAt?: string; up?: boolean; frames?: string[] }
@@ -133,6 +135,7 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* (_$, e) {
     w.sentTo.push(w.env.ANTHROPIC_BASE_URL)
+    if (w.hold) await w.hold
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
@@ -430,6 +433,58 @@ test('the band and the log show what Jev decided; the pane switches Jev routing 
 
   await turn($, w, clock, 'paused now', 1, 'turn-2')
   expect(w.sentTo.at(-1)).toBeUndefined()
+})
+
+test('while a request is in flight the band follows it: Jev decides, Claude thinks, then the card lands', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  let release = () => {}
+  w.hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+
+  // The band stays mounted, as in a session: its line must follow the scene as the clock moves it on.
+  const b = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props: BAND_PROPS })
+  await $.turn.start({ text: 'why does the test fail?', turnId: 'turn-1' })
+  const inFlight = step($, 'turn-1', 0)
+  await clock.settle()
+  expect(await b.find({ text: /Jev deciding/ })).toBeDefined()
+  // a long reply: the band keeps moving the whole time instead of going blank
+  for (let i = 0; i < 9; i++) await clock.advance(180)
+  expect(await b.find({ text: /Claude thinking/ })).toBeDefined()
+  await clock.advance(180 * 20)
+  expect(await b.find({ text: /Claude thinking/ })).toBeDefined()
+
+  w.gateway.events.push({ seq: 1, mode: 'hint', tool: 'Read', confidence: 0.99 })
+  release()
+  await inFlight
+  await clock.settle()
+  expect(await b.find({ text: /Jev picked Read 0\.99 \(hint\)/ })).toBeDefined()
+  await b.unmount()
+})
+
+test('with Jev routing off the band says requests pass straight through', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.gateway.routing = false
+  await start($)
+  const idle = await band($)
+  expect(await idle.find({ text: /Jev idle · routing off \(baseline\)/ })).toBeDefined()
+  await idle.unmount()
+
+  let release = () => {}
+  w.hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  await $.turn.start({ text: 'hello', turnId: 'turn-1' })
+  const inFlight = step($, 'turn-1', 0)
+  await clock.settle()
+  const passing = await band($)
+  expect(await passing.find({ text: /passing it through/ })).toBeDefined()
+  await passing.unmount()
+  release()
+  await inFlight
 })
 
 test('a reload mid-turn does not leave the band stuck', async ($, on) => {

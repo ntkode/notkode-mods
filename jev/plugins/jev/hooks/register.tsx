@@ -111,6 +111,8 @@ let polls: Promise<void> = Promise.resolve()
 // The animation: when the last tool call started (for the spark), the band's site, the timer.
 let lastToolAt = 0
 let bandSite: string | undefined
+/** The scene the band's line was last drawn for: the clock moves the scene on without a state change. */
+let drawnScene: Scene | undefined
 let ticker: { cancel: () => void } | undefined
 
 function message(error: unknown): string {
@@ -433,26 +435,37 @@ async function restart($: $): Promise<void> {
 
 // ------------------------------------------------------------ the band above the prompt
 
-type SceneState = { scene: Scene; frame: number; spark: boolean; card: Card }
+type SceneState = { scene: Scene; frame: number; spark: boolean; card: Card; asleep: boolean }
 
-/** What the band shows now, from the mod's state and the clock: the same answer for a redraw and for the animation. */
+/**
+ * What the band shows now, from the mod's state and the clock: the same answer for a redraw and
+ * for the animation. While a request is in flight (`asking`) the request travels to Jev, Jev
+ * decides, then the reply streams back for as long as it takes; once it is done (`working`)
+ * Claude acts on it. The gateway records a decision when its reply ends, so the card flies back
+ * after the stream, not during it.
+ */
 async function sceneOf($: $): Promise<SceneState> {
   const g = await read($, gateway)
-  const still = (scene: Scene): SceneState => ({ scene, frame: 0, spark: false, card: 'none' })
-  if (g.state === 'down') return still('error')
+  const asleep = g.routing === false
+  const still = (scene: Scene): SceneState => ({ scene, frame: 0, spark: false, card: 'none', asleep })
+  if (g.state === 'down') return { ...still('error'), asleep: false }
   if ((g.state !== 'up' && g.state !== 'external') || g.paused) return still('unset')
   const step = await read($, phase)
   if (!step) return still('idle')
   const now = await $.clock.now()
+  const since = (at: number) => Math.max(0, Math.floor((now - at) / FRAME_MS))
   const d = await read($, decision)
+  const card: Card = d ? cardFor(d.mode) : 'none'
   // The newest decision runs across to Claude first, then rests beside it.
-  if (d) {
-    const since = Math.max(0, Math.floor((now - d.at) / FRAME_MS))
-    if (since < ANSWER_FRAMES) return { scene: 'answering', frame: since, spark: false, card: cardFor(d.mode) }
+  if (d && since(d.at) < ANSWER_FRAMES) return { scene: 'answering', frame: since(d.at), spark: false, card, asleep }
+  const frame = since(step.at)
+  if (step.name === 'asking') {
+    // With routing off Jev is not asked: the request passes the sleeping owl straight on.
+    const decided = asleep ? TRAVEL_FRAMES : ASK_FRAMES
+    if (frame < decided) return { scene: 'asking', frame, spark: false, card: 'none', asleep }
+    return { scene: 'streaming', frame: frame - decided, spark: false, card: 'none', asleep }
   }
-  const frame = Math.max(0, Math.floor((now - step.at) / FRAME_MS))
-  if (step.name === 'asking' && frame < ASK_FRAMES && (!d || d.at < step.at)) return { scene: 'asking', frame, spark: false, card: 'none' }
-  return { scene: 'working', frame, spark: now - lastToolAt < 2 * FRAME_MS, card: d ? cardFor(d.mode) : 'none' }
+  return { scene: 'working', frame, spark: now - lastToolAt < 2 * FRAME_MS, card, asleep }
 }
 
 /** Repaints the scene's cells a few times a second while the turn moves; no redraw. */
@@ -461,8 +474,14 @@ function animate($: $): void {
   ticker = $.clock.every(FRAME_MS, async () => {
     if (!bandSite) return
     const now = await sceneOf($)
+    if (now.scene !== drawnScene) {
+      // asking turned into streaming, a card landed: the line beside the scene changes too
+      drawnScene = now.scene
+      $.ui.invalidate('ui.render')
+      return
+    }
     if (!ANIMATED.has(now.scene)) return
-    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark))
+    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark, now.asleep))
     await $.ui.blit({ requestId: bandSite, key: 'jev-scene', cells: art.cells }).catch(() => undefined)
   })
 }
@@ -484,6 +503,7 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
   const g = await read($, gateway)
   if (e.props.hasSurvey || g.state === 'off' || g.state === 'excluded') return next()
   const now = await sceneOf($)
+  drawnScene = now.scene
   const d = await read($, decision)
   const { Box, Text } = $.ui.resolve(e)
 
@@ -499,7 +519,8 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
     unset: <Text dimColor>{unset}</Text>,
     // At rest between turns; the routing switch is a standing setting, not something under way.
     idle: <Text dimColor>Jev idle · {g.routing === false ? 'routing off (baseline)' : 'routing on'}</Text>,
-    asking: <Text color="yellow">Jev deciding…</Text>,
+    asking: now.asleep ? <Text dimColor>routing off · passing it through</Text> : <Text color="yellow">Jev deciding…</Text>,
+    streaming: <Text color="yellow">Claude thinking…</Text>,
     answering: during,
     working: during,
     error: <Text color="red">gateway down · direct</Text>,
@@ -509,7 +530,7 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
   if (e.surface === 'terminal' && e.props.maxRows >= SCENE_ROWS + 1) {
     const { Raster } = $.ui.resolve(e)
     bandSite = e.requestId
-    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark))
+    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark, now.asleep))
     return (
       <Box flexDirection="row" marginTop={1}>
         <Raster key="jev-scene" columns={art.columns} rows={art.rows} cells={art.cells} />
@@ -949,6 +970,8 @@ export const register: Register = (on, options) => {
     if (turn && routed) await enter($, 'asking')
     const result = yield* next(e)
     if (turn && routed) {
+      // The reply is in: Claude acts on it while the decision flies back.
+      await enter($, 'working')
       void pollGateway($, turn)
       void $.clock
         .sleep(400)
