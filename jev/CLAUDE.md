@@ -38,8 +38,9 @@ Grep it for the event or noun at hand rather than guessing.
   rewritten; work after `yield*` runs once the request is done.
 - `$.process.run` waits for the whole output: detach long-lived processes (`nohup … &` with all
   three fds redirected) or the call hangs.
-- Module variables reset on every hot reload (and `session.start` fires again); `$.state` values
-  survive. A reload in the middle of a turn kills its background work: clear transient state at
+- Module variables reset on every reload; `$.state` values survive. A dev-folder hot reload fires
+  `session.start` again, but `/reload-plugins` and a plugin update do not: every hook that needs
+  the session's facts calls `ensureSession($)` first (it reads the folder with `$.session.cwd()`). A reload in the middle of a turn kills its background work: clear transient state at
   `session.start` and bound every network call with a timeout.
 - `$.env.set('ANTHROPIC_BASE_URL', …)` reroutes the session's next model request (proven).
   Never point it at something that isn't answering.

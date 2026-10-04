@@ -150,6 +150,48 @@ function roll(): number {
   return crypto.getRandomValues(new Uint32Array(1))[0]! / 2 ** 32
 }
 
+// ------------------------------------------------------------ the session's facts
+
+/** The folder the session runs in. */
+let sessionCwd = ''
+/** The session's facts, worked out once per load of the module. */
+let sessionReady: Promise<void> | undefined
+
+/**
+ * Works out the session's facts (home, log, key, routing leftovers) once per load. A reload
+ * (/reload-plugins, a plugin update) starts the module over without firing session.start, so every
+ * hook that needs them calls this first.
+ */
+function ensureSession($: $, cwd?: string): Promise<void> {
+  sessionReady ??= startSession($, cwd).catch(error => $.ui.log(`jev: ${message(error)}`, { to: 'debug' }))
+  return sessionReady
+}
+
+async function startSession($: $, cwd?: string): Promise<void> {
+  sessionCwd = cwd ?? (await $.session.cwd())
+  project = folderName(sessionCwd)
+  home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+  sessionId = await $.session.id()
+  const day = new Date(await $.clock.now()).toISOString().slice(0, 10)
+  logPath = home ? `${home}/.claude/jev-mod/log/${day}-${sessionId}.jsonl` : ''
+
+  // A load or reload starts with no turn in flight: clear what a cut-short one left behind, and
+  // views an older version of the mod left in another shape.
+  await update($, phase, () => null)
+  await update($, decision, () => null)
+  const last = (await read($, lastView)) as Record<string, unknown> | null
+  if (last && !('arm' in last)) await update($, lastView, () => null)
+  const totals = (await read($, sessionView)) as Record<string, unknown>
+  if (!('hintTurns' in totals)) await update($, sessionView, () => EMPTY_SESSION)
+
+  await $.command.register({ name: 'jev', description: 'Open the Jev pane: the last turn, the last 7 days (hints vs control, spend, savings), and the switches' })
+  await $.command.register({ name: 'jev-setup', description: "Add a key for Jev, so it is asked before Claude's requests" })
+
+  await undoGatewayRouting($)
+  await configure($, sessionCwd)
+  await refreshWeek($)
+}
+
 // ------------------------------------------------------------ the key and the session
 
 /** The key file and the environment, by jev-gateway's rule (the environment wins). */
@@ -987,36 +1029,12 @@ export const register: Register = (on, options) => {
   doneMode = options.doneCheck === 'on' || options.doneCheck === 'off' ? options.doneCheck : 'shadow'
   controlPercent = typeof options.controlPercent === 'number' && options.controlPercent >= 0 && options.controlPercent <= 100 ? options.controlPercent : 20
   excludedRepos = typeof options.excludedRepos === 'string' ? options.excludedRepos : ''
-  let cwd = ''
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    cwd = e.cwd
-    project = folderName(cwd)
-    home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
-    sessionId = await $.session.id()
-    const day = new Date(await $.clock.now()).toISOString().slice(0, 10)
-    logPath = home ? `${home}/.claude/jev-mod/log/${day}-${sessionId}.jsonl` : ''
-
-    // A load or reload starts with no turn in flight: clear what a cut-short one left behind, and
-    // views an older version of the mod left in another shape.
-    await update($, phase, () => null)
-    await update($, decision, () => null)
-    const last = (await read($, lastView)) as Record<string, unknown> | null
-    if (last && !('arm' in last)) await update($, lastView, () => null)
-    const totals = (await read($, sessionView)) as Record<string, unknown>
-    if (!('hintTurns' in totals)) await update($, sessionView, () => EMPTY_SESSION)
-
-    await $.command.register({ name: 'jev', description: 'Open the Jev pane: the last turn, the last 7 days (hints vs control, spend, savings), and the switches' })
-    await $.command.register({ name: 'jev-setup', description: "Add a key for Jev, so it is asked before Claude's requests" })
-
-    try {
-      await undoGatewayRouting($)
-      await configure($, cwd)
-      await refreshWeek($)
-    } catch (error) {
-      $.ui.log(`jev: ${message(error)}`, { to: 'debug' })
-    }
+    // A new session (or /clear) starts over, from the folder it names.
+    sessionReady = undefined
+    await ensureSession($, e.cwd)
     return started
   })
 
@@ -1024,6 +1042,7 @@ export const register: Register = (on, options) => {
 
   // Before Claude's first request: Jev reads the conversation and the new prompt; a hint rides the prompt.
   on('prompt.submit', async ($, e, next) => {
+    await ensureSession($)
     // A prompt delivered into a running turn is not a new turn's.
     if (e.turnId || !tracked()) return next(e)
     const arm = armFor((await read($, status)).paused === true)
@@ -1038,6 +1057,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    await ensureSession($)
     if (tracked()) {
       const o = opening ?? { arm: armFor((await read($, status)).paused === true), jev: emptyJevTurn() }
       opening = undefined
@@ -1097,6 +1117,7 @@ export const register: Register = (on, options) => {
   // Claude's stop: a promise of more work with nothing running sends it back to work (or, in shadow, is recorded).
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
+    await ensureSession($)
     const turn = current ? turns.get(current) : undefined
     // The main loop only, Jev's turns only, and never a stop that a push already caused.
     if (doneMode === 'off' || e.agent_id || e.stop_hook_active || !turn || (turn.arm !== 'hint' && turn.arm !== 'shadow' && turn.arm !== 'control') || result.block) return result
@@ -1121,12 +1142,22 @@ export const register: Register = (on, options) => {
   // ------------------------------------------------------------ commands and drawing
 
   on('command.run', { command: 'jev' }, async $ => {
+    await ensureSession($)
     const opened = await $.ui.open({ id: PANE, title: 'Jev' })
     return { text: opened.isPlaced ? 'Jev pane opened.' : 'Jev pane: widen the terminal to see it.' }
   })
 
-  on('command.run', { command: 'jev-setup' }, async $ => ({ text: await setup($, cwd) }))
+  on('command.run', { command: 'jev-setup' }, async $ => {
+    await ensureSession($)
+    return { text: await setup($, sessionCwd) }
+  })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => drawPane($, e))
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => drawBand($, e, () => next(e)))
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    await ensureSession($)
+    return drawPane($, e)
+  })
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    await ensureSession($)
+    return drawBand($, e, () => next(e))
+  })
 }

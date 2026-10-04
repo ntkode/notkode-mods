@@ -91,6 +91,7 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sess-1' }))
+  on('session.cwd', () => ({ value: '/Users/me/repo/demo-app' }))
   on('session.messages', () => ({ value: w.messages() as never }))
   on('session.usage', () => ({
     value: {
@@ -598,4 +599,14 @@ test('the pane switches the done check: shadow → on → off, saved in /config,
 
   w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
   expect((await stoppingTurn($, w, "I'll keep extracting.")).block).toBe(DONE_NUDGE)
+})
+
+test('a reload (no session.start) sets the session up on first use: the key is read and Jev is asked', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  // no start($): /reload-plugins and plugin updates load the module without session.start
+  const sent = await plainTurn($, w, 'why does the test fail?')
+  expect(sent).toMatchObject({ context: [hintText('Read')] })
+  expect(logged(w)[0]).toMatchObject({ arm: 'hint', project: 'demo-app' })
+  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 })
