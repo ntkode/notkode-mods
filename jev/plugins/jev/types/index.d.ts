@@ -1,3 +1,32 @@
+export type JevEconomy = {
+  days: number
+  turns: number
+  /** Turns that recorded Claude's cost (logged since the mod tracks it). */
+  pricedTurns: number
+  /** Claude's requests, at API prices. */
+  claudeUsd: number
+  /** Calls to Jev, as the provider priced them. */
+  jevUsd: number
+  /** Calls to Jev with no price reported. */
+  jevUnpriced: number
+  asks: number
+  hintTurns: number
+  controlTurns: number
+  /** Weekly quota points per dollar of Claude, from turns that recorded both. */
+  weekPctPerUsd?: number
+  saved?: {
+    /** Per turn with hints; negative when hints cost more. */
+    usdPerTurn: number
+    outputPerTurn: number
+    usd: number
+    output: number
+    /** The saving as points of the weekly quota, when the rate is known. */
+    weekPct?: number
+    /** The saving less what Jev cost on the turns with hints. */
+    netUsd: number
+  }
+}
+
 /** The last finished turn as the pane draws it. */
 export type JevTurnView = {
   prompt: string
@@ -30,6 +59,10 @@ export type JevSessionView = {
   output: number
   /** Jev's median latency per turn, newest last. */
   jevMs: number[]
+  /** What the calls to Jev cost this session, as the provider priced them. */
+  jevUsd: number
+  /** Calls to Jev this session whose provider reported no price. */
+  jevUnpriced: number
 }
 
 /**
@@ -60,6 +93,8 @@ declare module 'claude-code' {
       phase: { name: 'asking' | 'thinking' | 'working'; at: number; arm: JevArm; tool?: string } | null
       /** Jev's newest answer in the running turn. */
       decision: { mode: 'hint' | 'pass'; tool?: string; confidence?: number; reason?: string; shadow?: boolean; at: number } | null
+      /** The last 7 days from the log, as the pane's lines (answers, hints vs control, spend, savings); refreshed after each turn. */
+      week: string[] | null
       /** ANTHROPIC_BASE_URL before v0.4 routed the session through its gateway: read once, to undo that. */
       original: { saved: boolean; value: string | null }
     }

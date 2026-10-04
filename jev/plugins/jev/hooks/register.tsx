@@ -13,6 +13,8 @@ import {
   cleanPrompt,
   decide,
   decisionText,
+  dollars,
+  jevCost,
   duration,
   emptyJevTurn,
   folderName,
@@ -40,20 +42,23 @@ import {
   turnsFrom,
   upsertEnv,
 } from './logic'
-import type { Answer, Arm, Decision, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
+import type { Answer, Arm, Decision, Spend, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
 import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, STILL, rasterCells, scenePixels } from './sprites'
 import type { Card, Scene, SceneState } from './sprites'
 
 type $ = EngineInterface
 
 const PANE = 'jev'
-const EMPTY_SESSION: JevSessionView = { turns: 0, hintTurns: 0, controlTurns: 0, requests: 0, asked: 0, hinted: 0, followed: 0, output: 0, jevMs: [] }
+const EMPTY_SESSION: JevSessionView = { turns: 0, hintTurns: 0, controlTurns: 0, requests: 0, asked: 0, hinted: 0, followed: 0, output: 0, jevMs: [], jevUsd: 0, jevUnpriced: 0 }
 const status = atom({ plugin: 'jev', key: 'status' } as const, { state: 'off', mode: 'on' })
 const lastView = atom({ plugin: 'jev', key: 'last' } as const, null)
 const sessionView = atom({ plugin: 'jev', key: 'session' } as const, EMPTY_SESSION)
 const phase = atom({ plugin: 'jev', key: 'phase' } as const, null)
 const decision = atom({ plugin: 'jev', key: 'decision' } as const, null)
 const original = atom({ plugin: 'jev', key: 'original' } as const, { saved: false, value: null })
+const weekView = atom({ plugin: 'jev', key: 'week' } as const, null)
+/** The window the pane's summary covers. */
+const WEEK_DAYS = 7
 
 const FRAME_MS = 180
 /** How long a tool call waits for its response to end, to learn whether it is the response's last. */
@@ -82,6 +87,21 @@ type Turn = {
   /** The tool Jev pointed at for the next request (hinted, or would have in shadow). */
   pending?: string
   step?: Step
+  /** The session's cost and weekly quota when the turn started. */
+  before?: Usage
+}
+
+/** The session's cost so far (US dollars, API prices) and the weekly quota used (percent). */
+type Usage = { usd?: number; week?: number; weekResetsAt?: string }
+
+async function usageNow($: $): Promise<Usage> {
+  try {
+    const u = await $.session.usage()
+    const week = u.rateLimits.find(r => r.kind === 'seven_day')
+    return { ...(u.cost ? { usd: u.cost.usd } : {}), ...(week ? { week: week.percentUsed, ...(week.resetsAt ? { weekResetsAt: week.resetsAt } : {}) } : {}) }
+  } catch {
+    return {}
+  }
 }
 
 // The options, read at each load.
@@ -186,7 +206,7 @@ function armFor(paused: boolean): Turn['arm'] {
 // ------------------------------------------------------------ asking Jev
 
 /** One call to Jev, retried once on a busy or failing server; throws with the status on a refusal. */
-async function askJev($: $, a: JevAccess, state: JevState, questions: Record<string, Question>): Promise<Record<string, Answer>> {
+async function askJev($: $, a: JevAccess, state: JevState, questions: Record<string, Question>, spend?: Spend): Promise<Record<string, Answer>> {
   const init = {
     method: 'POST',
     headers: {
@@ -200,14 +220,25 @@ async function askJev($: $, a: JevAccess, state: JevState, questions: Record<str
   }
   for (let attempt = 0; ; attempt++) {
     const res = await $.http.fetch(a.url, init)
-    if (res.ok) return normalizeAnswers((JSON.parse(res.text) as { answers?: unknown }).answers)
+    if (res.ok) {
+      const body = JSON.parse(res.text) as { answers?: unknown; usage?: { cost?: unknown } }
+      if (spend) {
+        spend.calls++
+        // OpenRouter prices each call; the other providers report tokens only.
+        if (typeof body.usage?.cost === 'number') {
+          spend.priced++
+          spend.usd = (spend.usd ?? 0) + body.usage.cost
+        }
+      }
+      return normalizeAnswers(body.answers)
+    }
     if (attempt > 0 || !RETRYABLE.has(res.status)) throw Object.assign(new Error(`HTTP ${res.status} from ${PROVIDERS[a.provider].label}`), { status: res.status })
     await $.clock.sleep(100)
   }
 }
 
 /** What Jev makes of Claude's next request: the tools, the conversation, then jev-gateway's rule. */
-async function nextDecision($: $, rows: readonly MessageRow[], results: Readonly<Record<string, string>>): Promise<Decision> {
+async function nextDecision($: $, rows: readonly MessageRow[], results: Readonly<Record<string, string>>, spend: Spend): Promise<Decision> {
   const a = access
   if (!a) return { mode: 'pass', reason: 'jev_error: no key' }
   const tools: Tool[] = (await $.tool.list()).map(t => ({ name: t.name, description: t.description }))
@@ -218,10 +249,10 @@ async function nextDecision($: $, rows: readonly MessageRow[], results: Readonly
   let offered = tools
   if (tools.length > MAX_TOOLS) {
     const { questions, shards } = shortlistQuestions(tools)
-    offered = shortlisted(shards, await askJev($, a, state, questions))
+    offered = shortlisted(shards, await askJev($, a, state, questions, spend))
     if (offered.length === 0) return { mode: 'pass', reason: 'jev_unexpected_answer' }
   }
-  return decide(offered, await askJev($, a, state, toolQuestions(offered)))
+  return decide(offered, await askJev($, a, state, toolQuestions(offered), spend))
 }
 
 /** The main conversation as Jev reads it. */
@@ -241,10 +272,11 @@ async function consult($: $, jev: JevTurn, arm: JevArm, rows: readonly MessageRo
   const started = await $.clock.now()
   await update($, phase, () => ({ name: 'asking', at: started, arm }))
   animate($)
-  const work = nextDecision($, rows, results).catch((error): Decision => ({ mode: 'pass', reason: `jev_error: ${message(error)}` }))
+  const spend: Spend = { calls: 0, priced: 0 }
+  const work = nextDecision($, rows, results, spend).catch((error): Decision => ({ mode: 'pass', reason: `jev_error: ${message(error)}` }))
   const d: Decision = (await within($, work, JEV_TIMEOUT_MS)) ?? { mode: 'pass', reason: 'jev_timeout' }
   const at = await $.clock.now()
-  tally(jev, d, at - started)
+  tally(jev, d, at - started, spend)
   await update($, decision, () => ({
     mode: d.mode,
     at,
@@ -431,6 +463,11 @@ type TurnEnd = {
 }
 
 async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<void> {
+  const after = await usageNow($)
+  const before = turn.before ?? {}
+  const delta = (a?: number, b?: number) => (a !== undefined && b !== undefined ? Math.max(0, Math.round((a - b) * 1e6) / 1e6) : undefined)
+  const usd = delta(after.usd, before.usd)
+  const weekPct = delta(after.week, before.week)
   const record: TurnRecord = {
     type: 'turn',
     v: 4,
@@ -449,11 +486,21 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
       ...(e.usage
         ? { usage: { input: e.usage.input_tokens, output: e.usage.output_tokens, cacheRead: e.usage.cache_read_input_tokens, cacheWrite: e.usage.cache_creation_input_tokens } }
         : {}),
+      ...(usd !== undefined ? { usd } : {}),
+      ...(weekPct !== undefined ? { weekPct } : {}),
+      ...(after.week !== undefined ? { weekUsed: after.week } : {}),
     },
     ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
   }
   await log($, record)
   await publish($, record)
+  await refreshWeek($)
+}
+
+/** The last days from the log, for the pane: what Jev answered, hints vs control, spend, savings. */
+async function refreshWeek($: $): Promise<void> {
+  const lines = report(await readLogs($, WEEK_DAYS), WEEK_DAYS).split('\n')
+  await update($, weekView, () => lines)
 }
 
 /** Feeds the pane (the turn just logged, the session's totals) and returns the band to rest. */
@@ -493,6 +540,8 @@ async function publish($: $, record: TurnRecord): Promise<void> {
       followed: s.followed + (hinting ? (j?.followed ?? 0) : 0),
       output: s.output + (record.actual.usage?.output ?? 0),
       jevMs: j?.ms.length ? [...s.jevMs, median(j.ms)].slice(-100) : s.jevMs,
+      jevUsd: s.jevUsd + (j?.usd ?? 0),
+      jevUnpriced: s.jevUnpriced + (j?.unpriced ?? 0),
     }
   })
   await update($, decision, () => null)
@@ -541,6 +590,8 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
     </Box>
   )
   const now = await sceneOf($)
+  const usage = await usageNow($)
+  const week = await read($, weekView)
   const lj = last?.jev
   const sessionJev = session.jevMs.length ? median(session.jevMs) : undefined
 
@@ -645,6 +696,50 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         )}
       </Box>
 
+      {/* what it cost, and what hints saved */}
+      <Box marginTop={1} flexDirection="column">
+        <Text>
+          <Text bold>Spend</Text>
+          <Text dimColor>  this session</Text>
+        </Text>
+        <Text wrap="truncate-end">
+          {label('this session')}
+          {usage.usd !== undefined ? <Text>Claude {dollars(usage.usd)}</Text> : <Text dimColor>Claude cost unknown</Text>}
+          <Text dimColor> at API prices</Text>
+          <Text> · Jev {jevCost(session.jevUsd, session.jevUnpriced)}</Text>
+          <Text dimColor> over {session.asked} asks</Text>
+        </Text>
+        {usage.week !== undefined ? (
+          <Text wrap="truncate-end">
+            {label('weekly quota')}
+            <Text color={usage.week >= 80 ? 'red' : usage.week >= 50 ? 'yellow' : undefined} bold>{usage.week.toFixed(1)}%</Text>
+            <Text dimColor> used{usage.weekResetsAt ? ` · resets ${resets(usage.weekResetsAt)}` : ''}</Text>
+          </Text>
+        ) : (
+          <Text dimColor>{'weekly quota'.padEnd(16)}not reported (API key, or no request yet)</Text>
+        )}
+      </Box>
+
+      {/* the last days, from the log */}
+      {week ? (
+        <Box marginTop={1} flexDirection="column">
+          {week.map((line, i) =>
+            line === '' ? (
+              <Text key={`week-${i}`}> </Text>
+            ) : i === 0 ? (
+              <Text key="week-0" wrap="wrap">
+                <Text bold>{line.split(':')[0]}</Text>
+                <Text dimColor>{line.slice(line.indexOf(':') + 1)}</Text>
+              </Text>
+            ) : (
+              <Text key={`week-${i}`} wrap="wrap" dimColor={line.startsWith('  ')} color={/^\s*Hints (saved|cost)/.test(line) ? (line.includes('saved') ? 'green' : 'yellow') : undefined}>
+                {line.trim()}
+              </Text>
+            ),
+          )}
+        </Box>
+      ) : null}
+
       {/* the session */}
       <Box marginTop={1} flexDirection="column">
         <Text bold>This session</Text>
@@ -662,22 +757,29 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       <Box marginTop={1}>
         <Text dimColor wrap="wrap">
           {s.mode === 'shadow'
-            ? 'Shadow: Jev is asked and its picks are recorded, but Claude never sees them. /jev-report shows how often Claude chose the same tool on its own.'
+            ? 'Shadow: Jev is asked and its picks are recorded, but Claude never sees them. The last 7 days show how often Claude chose the same tool on its own.'
             : last === null
-              ? "Jev picks the tool that fits Claude's next step, and Claude gets it as a hint it may ignore. Some turns run without Jev (control), so /jev-report can tell whether hints help on your own work."
-              : '/jev-report puts turns with hints next to control turns: same kind of work, with and without Jev.'}
+              ? "Jev picks the tool that fits Claude's next step, and Claude gets it as a hint it may ignore. Some turns run without Jev (control), so the last 7 days can tell whether hints help on your own work."
+              : 'Hints vs control puts turns with hints next to turns without Jev: same kind of work, with and without.'}
         </Text>
       </Box>
 
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
         {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
         {ready ? <Button key="pause" hotkey="p" plain label={s.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !s.paused)} /> : null}
-        <Button key="report" hotkey="r" plain label="report" onPress={() => void $.command.run({ command: 'jev-report', args: '' })} />
         {/* the terminal's pane has its own ✕ */}
         {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
     </Box>
   )
+}
+
+/** `Mon 14:00` for a reset time. */
+function resets(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]
+  return `${day} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 /** Stops or resumes asking Jev in this session alone. */
@@ -823,13 +925,13 @@ export const register: Register = (on, options) => {
     const totals = (await read($, sessionView)) as Record<string, unknown>
     if (!('hintTurns' in totals)) await update($, sessionView, () => EMPTY_SESSION)
 
-    await $.command.register({ name: 'jev', description: 'Open the Jev pane: what Jev answered on the last turn, and the switches' })
+    await $.command.register({ name: 'jev', description: 'Open the Jev pane: the last turn, the last 7 days (hints vs control, spend, savings), and the switches' })
     await $.command.register({ name: 'jev-setup', description: "Add a key for Jev, so it is asked before Claude's requests" })
-    await $.command.register({ name: 'jev-report', description: 'What Jev answered, and turns with hints vs control turns', argumentHint: '[days]' })
 
     try {
       await undoGatewayRouting($)
       await configure($, cwd)
+      await refreshWeek($)
     } catch (error) {
       $.ui.log(`jev: ${message(error)}`, { to: 'debug' })
     }
@@ -857,7 +959,7 @@ export const register: Register = (on, options) => {
     if (tracked()) {
       const o = opening ?? { arm: armFor((await read($, status)).paused === true), jev: emptyJevTurn() }
       opening = undefined
-      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}) })
+      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}), before: await usageNow($) })
       current = e.turnId
     }
     return next(e)
@@ -928,11 +1030,6 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'jev-setup' }, async $ => ({ text: await setup($, cwd) }))
-
-  on('command.run', { command: 'jev-report' }, async ($, e) => {
-    const days = Math.max(1, Math.min(90, Number.parseInt(e.args.trim(), 10) || 7))
-    return { text: report(await readLogs($, days), days) }
-  })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => drawPane($, e))
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => drawBand($, e, () => next(e)))

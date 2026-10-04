@@ -56,7 +56,7 @@ real on macOS (interactive, tmux) with an OpenCode key.
 - **v0.4 leftover**: a session still pointing at `127.0.0.1:8794` is sent back to the URL saved in
   `original` (or the default). The old gateway process is not stopped (README says how).
 - **Seen**: band (scene, then the status line with the routing setting under it), pane (`/jev`),
-  `/jev-report` (hints vs control, 5 turns of each), log in `~/.claude/jev-mod/log/` (v4 records).
+  the pane's last 7 days (hints vs control, 5 turns of each; spend and savings), log in `~/.claude/jev-mod/log/` (v4 records).
 
 ## Verified
 
@@ -100,7 +100,7 @@ external `jev-claude` mode, excluded repos, the marketplace install from GitHub.
    row already describe it).
 2. Run it on Windows once; fix what breaks.
 3. Install on a second machine; drive `/jev-setup` there.
-4. Use it: read `/jev-report` once hints and control have 5 turns each. That is idea 1's live
+4. Use it: read the pane's last 7 days once hints and control have 5 turns each. That is idea 1's live
    stage; write `research/results/07-…` with the numbers.
 5. Open the issues drafted in `research/upstream/jev-gateway.md` that still apply (README link,
    fast-lane proposal).

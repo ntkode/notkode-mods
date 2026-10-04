@@ -44,13 +44,15 @@ type World = {
   toolUseIds: string[]
   /** While set, a tool call stays running until it resolves. */
   toolHold?: Promise<void>
+  /** What `$.session.usage()` reports: the session's cost and the weekly quota used. */
+  usage: { usd: number; week?: number }
 }
 
 type Setup = { key?: boolean; env?: Record<string, string> }
 
 /** The world beneath the plugin: the environment, files, the conversation, Jev's API, the model, the tools, the clipboard. */
 function world(on: On, clock: MockClock, setup: Setup = {}): World {
-  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [] }
+  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [], usage: { usd: 0 } }
   if (setup.key !== false) w.files[KEY_FILE] = `JEV_PROVIDER=openrouter\nOPENROUTER_API_KEY=${KEY}\n`
 
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
@@ -88,6 +90,14 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sess-1' }))
   on('session.messages', () => ({ value: w.messages() as never }))
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: {} as never,
+      rateLimits: w.usage.week !== undefined ? [{ kind: 'seven_day', percentUsed: w.usage.week, resetsAt: '2026-10-05T14:00:00' }] : [],
+      cost: { usd: w.usage.usd },
+    },
+  }))
   on('tool.list', () => ({ value: TOOLS }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('ui.toast', () => ({ value: undefined }))
@@ -218,8 +228,10 @@ test('asks Jev before the first request and after the tools; each hint rides the
   })
   expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 
-  const out = await command($, 'jev-report')
-  expect(out.text).toContain('1 turns · 1 with hints · 0 control · 0 shadow.')
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /1 turns · 1 with hints · 0 control · 0 shadow\./ })).toBeDefined()
+  expect(await pane.find({ type: 'Button', key: 'report' })).toBeUndefined()
+  await pane.unmount()
 })
 
 test('one ask per response: with calls in parallel, only the last to finish asks and carries the hint', HINTS, async ($, on) => {
@@ -440,4 +452,26 @@ test("the pane shows the last turn's answers, and pausing stops Jev for this ses
   await plainTurn($, w, 'and now?', 'turn-2')
   expect(w.asks).toHaveLength(1)
   expect(logged(w)[1]).toMatchObject({ arm: 'off' })
+})
+
+test("spend: Jev's price per call, Claude's cost and weekly quota per turn, in the log and the pane", HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.usage = { usd: 1.0, week: 40 }
+  await start($)
+  w.jev.push({ status: 200, body: { ...answer('Read').body, usage: { cost: 0.00012 } } })
+  await submit($, 'what changed?')
+  await $.turn.start({ text: 'what changed?', turnId: 'turn-1' })
+  await step($, 'turn-1', 0)
+  w.usage = { usd: 1.35, week: 40.5 }
+  await complete($, w, 'turn-1')
+  expect(logged(w)[0]).toMatchObject({ actual: { usd: 0.35, weekPct: 0.5, weekUsed: 40.5 }, jev: { usd: 0.00012, unpriced: 0 } })
+
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /Claude \$1\.35/ })).toBeDefined()
+  expect(await pane.find({ text: /Jev \$0\.0001/ })).toBeDefined()
+  expect(await pane.find({ text: /40\.5%/ })).toBeDefined()
+  expect(await pane.find({ text: /need 5 priced turns with hints and 5 control turns \(have 1 and 0\)/ })).toBeDefined()
+  expect(await pane.find({ text: /Spent over 1 tracked turns: Claude \$0\.350 at API prices · Jev \$0\.0001 over 1 asks\./ })).toBeDefined()
+  await pane.unmount()
 })

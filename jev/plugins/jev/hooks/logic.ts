@@ -1,3 +1,5 @@
+import type { JevEconomy } from '../types'
+
 // Pure parts of the mod: what Jev is asked, how its answer becomes a hint, the key file, the log
 // and the report. Nothing here touches `$`, so tests run it as is.
 //
@@ -326,14 +328,25 @@ export type JevTurn = {
   ms: number[]
   /** Who decided each request, in order. */
   cards: DecisionCard[]
+  /** What the calls to Jev cost, in US dollars, as the provider reported it. */
+  usd: number
+  /** Calls whose provider reported no price (they count in `asked`, not in `usd`). */
+  unpriced: number
 }
+
+/** What one ask's calls to Jev cost; `usd` stays undefined while no call reported a price. */
+export type Spend = { usd?: number; calls: number; priced: number }
 
 export function emptyJevTurn(): JevTurn {
-  return { asked: 0, hinted: 0, followed: 0, picks: [], reasons: {}, ms: [], cards: [] }
+  return { asked: 0, hinted: 0, followed: 0, picks: [], reasons: {}, ms: [], cards: [], usd: 0, unpriced: 0 }
 }
 
-export function tally(turn: JevTurn, d: Decision, ms: number): void {
+export function tally(turn: JevTurn, d: Decision, ms: number, spend?: Spend): void {
   turn.asked++
+  if (spend) {
+    turn.usd += spend.usd ?? 0
+    turn.unpriced += spend.calls - spend.priced
+  }
   if (turn.ms.length < 200) turn.ms.push(Math.round(ms))
   if (turn.cards.length < 200) turn.cards.push(cardFor(d))
   if (d.mode === 'hint' && d.tool) {
@@ -362,6 +375,12 @@ export type TurnRecord = {
     reason: string
     tools: number
     usage?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+    /** What Claude's requests this turn cost, in US dollars at API prices (the session's cost before and after). */
+    usd?: number
+    /** Points of the weekly quota the session's account used during the turn (other sessions' use included). */
+    weekPct?: number
+    /** The weekly quota used at the end of the turn, in percent. */
+    weekUsed?: number
   }
   jev?: JevTurn
 }
@@ -400,14 +419,14 @@ export const MIN_GROUP = 5
 
 export function report(records: readonly LogRecord[], days: number): string {
   const turns = records.filter(r => r.type === 'turn' && r.v === 4)
-  if (turns.length === 0) return `Jev report (last ${days} days): no turns logged yet.`
+  if (turns.length === 0) return `Last ${days} days: no turns logged yet.`
   const by = (arm: TurnRecord['arm']) => turns.filter(t => t.arm === arm)
   const hint = by('hint')
   const control = by('control')
   const shadow = by('shadow')
   const rest = turns.length - hint.length - control.length - shadow.length
   const lines = [
-    `Jev report, last ${days} days: ${turns.length} turns · ${hint.length} with hints · ${control.length} control · ${shadow.length} shadow${rest > 0 ? ` · ${rest} excluded or off` : ''}.`,
+    `Last ${days} days: ${turns.length} turns · ${hint.length} with hints · ${control.length} control · ${shadow.length} shadow${rest > 0 ? ` · ${rest} excluded or off` : ''}.`,
   ]
 
   const asked = [...hint, ...shadow].filter(t => t.jev && t.jev.asked > 0)
@@ -451,7 +470,88 @@ export function report(records: readonly LogRecord[], days: number): string {
   } else {
     lines.push(`  ${hint.length} turns with hints, ${control.length} control: need ${MIN_GROUP} of each. Control turns come up on their own ("Jev: control group" in /config).`)
   }
+  lines.push('', ...economyLines(economy(records, days)))
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------- spend and savings
+
+/**
+ * What the last days cost, and what hints saved against control turns. The saving is an estimate:
+ * median turn with hints vs median control turn, times the turns with hints, converted into
+ * weekly quota at the rate the account's turns have used it (quota points per dollar).
+ */
+export type Economy = JevEconomy
+
+export function economy(records: readonly LogRecord[], days: number): Economy {
+  const turns = records.filter(r => r.type === 'turn' && r.v === 4)
+  const hint = turns.filter(t => t.arm === 'hint')
+  const control = turns.filter(t => t.arm === 'control')
+  const sum = (xs: readonly number[]) => xs.reduce((a, b) => a + b, 0)
+  const rated = turns.filter(t => t.actual.usd !== undefined && t.actual.weekPct !== undefined)
+  const ratedUsd = sum(rated.map(t => t.actual.usd!))
+  const e: Economy = {
+    days,
+    turns: turns.length,
+    pricedTurns: turns.filter(t => t.actual.usd !== undefined).length,
+    claudeUsd: sum(turns.map(t => t.actual.usd ?? 0)),
+    jevUsd: sum(turns.map(t => t.jev?.usd ?? 0)),
+    jevUnpriced: sum(turns.map(t => t.jev?.unpriced ?? 0)),
+    asks: sum(turns.map(t => t.jev?.asked ?? 0)),
+    hintTurns: hint.length,
+    controlTurns: control.length,
+    ...(ratedUsd > 0 ? { weekPctPerUsd: sum(rated.map(t => t.actual.weekPct!)) / ratedUsd } : {}),
+  }
+  const priced = (g: readonly TurnRecord[]) => g.filter(t => t.actual.usd !== undefined)
+  const h = priced(hint)
+  const c = priced(control)
+  if (h.length >= MIN_GROUP && c.length >= MIN_GROUP) {
+    const usdPerTurn = median(c.map(t => t.actual.usd!)) - median(h.map(t => t.actual.usd!))
+    const outputPerTurn = median(c.map(t => t.actual.usage?.output ?? 0)) - median(h.map(t => t.actual.usage?.output ?? 0))
+    const usd = usdPerTurn * hint.length
+    e.saved = {
+      usdPerTurn,
+      outputPerTurn,
+      usd,
+      output: outputPerTurn * hint.length,
+      ...(e.weekPctPerUsd !== undefined ? { weekPct: usd * e.weekPctPerUsd } : {}),
+      netUsd: usd - sum(hint.map(t => t.jev?.usd ?? 0)),
+    }
+  }
+  return e
+}
+
+/** `$0.0042`, `$1.27`, `$214`. */
+export function dollars(usd: number): string {
+  const a = Math.round(Math.abs(usd) * 1e6) / 1e6
+  const text = a >= 100 ? a.toFixed(0) : a >= 1 ? a.toFixed(2) : a >= 0.01 ? a.toFixed(3) : a.toFixed(4)
+  return `${usd < 0 ? '-' : ''}$${text}`
+}
+
+/** What Jev cost: `$0.0042`, or that its provider prices nothing (a free model). */
+export function jevCost(usd: number, unpriced: number): string {
+  if (usd === 0 && unpriced > 0) return 'not priced by the provider'
+  return `${dollars(usd)}${unpriced > 0 ? ` + ${unpriced} unpriced calls` : ''}`
+}
+
+/** The spend and savings lines of the report and the pane. */
+export function economyLines(e: Economy): string[] {
+  const lines = [
+    `Spent over ${e.pricedTurns} tracked turns: Claude ${dollars(e.claudeUsd)} at API prices · Jev ${jevCost(e.jevUsd, e.jevUnpriced)} over ${e.asks} asks.`,
+  ]
+  if (e.weekPctPerUsd !== undefined && e.weekPctPerUsd > 0) lines.push(`  At your account's rate, 1% of the weekly quota ≈ ${dollars(1 / e.weekPctPerUsd)} of Claude.`)
+  const s = e.saved
+  if (!s) {
+    lines.push(`  Savings: need ${MIN_GROUP} priced turns with hints and ${MIN_GROUP} control turns (have ${e.hintTurns} and ${e.controlTurns}).`)
+    return lines
+  }
+  const word = s.usd >= 0 ? 'saved' : 'cost'
+  const quota = s.weekPct !== undefined ? `, ${Math.abs(s.weekPct).toFixed(1)}% of the weekly quota` : ''
+  lines.push(
+    `  Hints ${word} ≈ ${dollars(Math.abs(s.usdPerTurn))} and ${tokens(Math.abs(Math.round(s.outputPerTurn)))} output tokens per turn → ${dollars(Math.abs(s.usd))}${quota} over ${e.hintTurns} turns.`,
+    `  Net of Jev: ${dollars(s.netUsd)}. An estimate: median turn with hints vs median control turn.`,
+  )
+  return lines
 }
 
 // ---------------------------------------------------------------- helpers

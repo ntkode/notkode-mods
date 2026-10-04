@@ -11,6 +11,10 @@ import {
   cleanPrompt,
   decide,
   decisionText,
+  dollars,
+  economy,
+  economyLines,
+  jevCost,
   duration,
   emptyJevTurn,
   folderName,
@@ -37,6 +41,9 @@ import {
   upsertEnv,
 } from '../hooks/logic'
 import type { Answer, JevTurn, LogRecord, TurnRecord } from '../hooks/logic'
+
+/** Rounds away float noise in dollar sums. */
+const round = (n: number | undefined) => Math.round((n ?? NaN) * 1e6) / 1e6
 
 const TOOLS = [
   { name: 'Read', description: 'Reads a file.' },
@@ -174,12 +181,12 @@ describe('turns and decisions', () => {
     tally(j, { mode: 'hint', tool: 'Read', confidence: 0.9 }, 240)
     tally(j, { mode: 'pass', reason: 'low_confidence', confidence: 0.4 }, 300)
     tally(j, { mode: 'pass', reason: 'jev_error: HTTP 500' }, 90)
-    expect(j).toEqual({ asked: 3, hinted: 1, followed: 0, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1, jev_error: 1 }, ms: [240, 300, 90], cards: ['pick', 'pass', 'fail'] })
+    expect(j).toEqual({ asked: 3, hinted: 1, followed: 0, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1, jev_error: 1 }, ms: [240, 300, 90], cards: ['pick', 'pass', 'fail'], usd: 0, unpriced: 0 })
   })
 })
 
 describe('the report', () => {
-  const jev = (): JevTurn => ({ asked: 2, hinted: 1, followed: 1, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1 }, ms: [200, 300], cards: ['pick', 'pass'] })
+  const jev = (): JevTurn => ({ asked: 2, hinted: 1, followed: 1, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1 }, ms: [200, 300], cards: ['pick', 'pass'], usd: 0.0004, unpriced: 0 })
   const turn = (id: string, arm: TurnRecord['arm'], steps: number, output: number, ms: number): TurnRecord => ({
     type: 'turn',
     v: 4,
@@ -196,7 +203,7 @@ describe('the report', () => {
   test('compares turns with hints against control turns once both groups are big enough', () => {
     const records: LogRecord[] = [...[1, 2, 3, 4, 5].map(i => turn(`h${i}`, 'hint', 3, 300, 6_000)), ...[1, 2, 3, 4, 5].map(i => turn(`c${i}`, 'control', 4, 500, 10_000))]
     const text = report(records, 7)
-    expect(text).toContain('Jev report, last 7 days: 10 turns · 5 with hints · 5 control · 0 shadow.')
+    expect(text).toContain('Last 7 days: 10 turns · 5 with hints · 5 control · 0 shadow.')
     expect(text).toContain('Jev was asked 10 times and was confident on 5 (50%).')
     expect(text).toContain('Claude followed 5 of 5 hints (100%).')
     expect(text).toContain('Tools Jev picked: Read 5.')
@@ -211,6 +218,37 @@ describe('the report', () => {
     const text = report([turn('h1', 'hint', 2, 200, 5_000), turn('x1', 'excluded', 1, 50, 1_000)], 7)
     expect(text).toContain('2 turns · 1 with hints · 0 control · 0 shadow · 1 excluded or off.')
     expect(text).toContain('1 turns with hints, 0 control: need 5 of each.')
+  })
+
+  test('spend, and the saving against control turns in dollars and weekly quota, net of Jev', () => {
+    const priced = (t: TurnRecord, usd: number, weekPct: number): TurnRecord => ({ ...t, actual: { ...t.actual, usd, weekPct } })
+    const records: LogRecord[] = [
+      ...[1, 2, 3, 4, 5].map(i => priced(turn(`h${i}`, 'hint', 3, 300, 6_000), 0.4, 0.2)),
+      ...[1, 2, 3, 4, 5].map(i => priced(turn(`c${i}`, 'control', 4, 500, 10_000), 0.6, 0.3)),
+    ]
+    const e = economy(records, 7)
+    expect(round(e.claudeUsd)).toBe(5)
+    expect(round(e.jevUsd)).toBe(0.002)
+    expect(round(e.weekPctPerUsd)).toBe(0.5)
+    expect(round(e.saved!.usdPerTurn)).toBe(0.2)
+    expect(round(e.saved!.usd)).toBe(1)
+    expect(round(e.saved!.weekPct)).toBe(0.5)
+    expect(round(e.saved!.netUsd)).toBe(0.998)
+    const lines = economyLines(e).join('\n')
+    expect(lines).toContain('Spent over 10 tracked turns: Claude $5.00 at API prices · Jev $0.0020 over 10 asks.')
+    expect(lines).toContain('1% of the weekly quota ≈ $2.00 of Claude')
+    expect(lines).toContain('Hints saved ≈ $0.200 and 200 output tokens per turn → $1.00, 0.5% of the weekly quota over 5 turns.')
+    expect(report(records, 7)).toContain('Net of Jev: $0.998.')
+  })
+
+  test('no saving claimed before both groups have priced turns', () => {
+    const e = economy([turn('h1', 'hint', 2, 200, 5_000)], 7)
+    expect(e.saved).toBeUndefined()
+    expect(economyLines(e).join('\n')).toContain('need 5 priced turns with hints and 5 control turns (have 1 and 0)')
+    expect(dollars(0.00042)).toBe('$0.0004')
+    expect(dollars(-1.5)).toBe('-$1.50')
+    expect(jevCost(0, 4)).toBe('not priced by the provider')
+    expect(jevCost(0.002, 1)).toBe('$0.0020 + 1 unpriced calls')
   })
 
   test('ignores records from earlier versions of the mod', () => {

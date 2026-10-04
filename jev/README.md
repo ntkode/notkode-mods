@@ -25,7 +25,11 @@ watch it happen and measure whether it helps on your own work.
   Then Claude thinks and works while the owl holds still. The status line sits beside the scene,
   with the routing setting under it.
 - **Measures it honestly.** 20% of turns run without Jev (a control group, drawn at random), and
-  `/jev-report` compares turns with hints against them on requests, output tokens and time.
+  the `/jev` pane compares turns with hints against them on requests, output tokens and time.
+- **Shows what it costs and saves.** The pane shows what the session cost (Claude at API prices,
+  and Jev's calls as the provider prices them) and how much of your weekly quota is used. Once 5
+  turns with hints and 5 control turns are logged, it estimates what hints saved per turn, in
+  dollars and as a share of the weekly quota, net of Jev's cost.
 - **Respects private work.** Repos you exclude never ask Jev, so their conversations never reach
   it, and their prompts stay out of the plugin's log.
 
@@ -66,7 +70,8 @@ the key is never shown or passed on a command line. Keys in the environment (`OP
 `TYPESAFE_API_KEY`, …) work too and win over the file.
 
 Open the pane with `/jev`. It shows where Jev runs, what it answered on the last turn, the session's
-totals, a switch to pause Jev for this session, and the report.
+totals and spend, the last 7 days (what Jev answered, hints vs control, spend and savings), and a
+switch to pause Jev for this session.
 
 ## Settings
 
@@ -75,7 +80,7 @@ In `/config`, under the plugin:
 | Option | Default | What it does |
 |---|---|---|
 | Jev: hints | `on` | `on`: Claude gets Jev's confident picks. `shadow`: Jev is asked and its picks are recorded, but Claude never sees them. `off`: Jev is never asked |
-| Jev: control group (%) | `20` | with hints on, this share of turns runs without Jev, for `/jev-report` to compare. `0` turns it off |
+| Jev: control group (%) | `20` | with hints on, this share of turns runs without Jev, for the `/jev` pane to compare. `0` turns it off |
 | Jev: excluded repos | empty | comma-separated folder names where Jev is never asked |
 
 Options are stored per install: a marketplace install (`jev@notkode-mods`) and a `--plugin-dir` copy
