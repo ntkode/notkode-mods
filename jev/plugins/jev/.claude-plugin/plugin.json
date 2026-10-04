@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"
@@ -32,6 +32,17 @@
       "title": "Jev: control group (%)",
       "description": "With hints on, this share of turns runs without Jev, so the /jev pane can compare hints with no hints on your own work. 0 turns it off.",
       "default": 20
+    },
+    "doneCheck": {
+      "type": "string",
+      "title": "Jev: done check",
+      "description": "When Claude stops after promising more work, with nothing running and nothing asked of you, Jev catches it. shadow: recorded in /jev only. on: Claude is sent back to work (once per turn). off: never checked.",
+      "options": [
+        "shadow",
+        "on",
+        "off"
+      ],
+      "default": "shadow"
     },
     "excludedRepos": {
       "type": "string",

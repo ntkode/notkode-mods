@@ -45,6 +45,8 @@ export type JevTurnView = {
     /** What Jev answered each time it was asked, in order: `pick` (a hint), `pass` or `fail`. */
     cards: string[]
   }
+  /** The done check at the turn's last stop. */
+  done?: { verdict: 'push' | 'ok' | 'running' | 'error'; pushed: boolean }
 }
 
 /** This session's running totals. */

@@ -75,6 +75,16 @@ external `jev-claude` mode, excluded repos, the marketplace install from GitHub.
 
 - [x] Licence: jev-gateway is MIT (package and LICENSE); jevMod is MIT.
 
+## Done check (v0.6, shadow)
+
+Idea 14, from [08](research/results/08-done-check.md). At Claude's stop (`classic.Stop`, main
+loop, once per turn): pending background tasks or crons keep the promise and Jev is not asked;
+otherwise one call with three questions (work requested ≥ 0.5, waiting on the user < 0.1,
+final message promises more ≥ 0.9). `shadow` logs the verdict (`done` in the turn record, a line
+in the pane); `on` answers the stop with `block` and a nudge. Verified live: a promised import
+with nothing running was caught in 453 ms. **Go live** once a week of shadow records reads ≤ 3
+wrong pushes per 100 stops (read the turns the pane counts as broken promises).
+
 ## Still open before release
 
 - [ ] **A hint seen live**: the first live run's asks were all passes (unsure, no tool needed).

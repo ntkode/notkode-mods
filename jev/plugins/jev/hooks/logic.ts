@@ -358,6 +358,83 @@ export function tally(turn: JevTurn, d: Decision, ms: number, spend?: Spend): vo
   }
 }
 
+// ---------------------------------------------------------------- the done check
+
+/**
+ * When Claude stops, Jev reads whether its final message promises more work. If it does, the user
+ * asked for work, Claude is not waiting on the user, and nothing it started is still running, the
+ * stop is a broken promise. Backtested on 14 days of turns (research/results/08-done-check.md):
+ * these three questions at 0.9 pushed none of 400 normal turns; "is it finished?" fails.
+ */
+export const DONE_QUESTIONS: Record<'requested' | 'waiting' | 'promised', Question> = {
+  requested: {
+    type: 'noul',
+    instructions: "Did the user's LATEST message ask the assistant to do work (make changes, run commands, deploy, investigate, build or produce something), rather than only ask a question or chat?",
+  },
+  waiting: {
+    type: 'noul',
+    instructions:
+      'Is the assistant genuinely waiting on the user: it needs a decision between options, approval for a risky or irreversible step, a credential, an action only the user can take, or information only the user has?',
+  },
+  promised: {
+    type: 'noul',
+    instructions: "Does the assistant's FINAL message say it will do something next, or that work is still under way, instead of reporting the work as finished?",
+  },
+}
+
+/** How sure Jev must be that more work was promised (and not that Claude is waiting on the user). */
+export const DONE_CONFIDENCE = 0.9
+
+/**
+ * What the done check made of a stop: `push` (a broken promise: Claude should carry on), `ok`,
+ * `running` (background work or a scheduled wake-up keeps the promise, so Jev was not asked),
+ * or `error` (Jev failed or was too slow: the stop goes through).
+ */
+export type DoneVerdict = 'push' | 'ok' | 'running' | 'error'
+
+export type DoneCheck = {
+  verdict: DoneVerdict
+  /** Whether the stop was really refused (mode on), or only recorded (shadow). */
+  pushed: boolean
+  requested?: number
+  waiting?: number
+  promised?: number
+  ms?: number
+  usd?: number
+  reason?: string
+}
+
+export function doneVerdict(answers: Readonly<Record<string, Answer>>, at = DONE_CONFIDENCE): Omit<DoneCheck, 'pushed' | 'ms' | 'usd'> {
+  const noul = (k: string) => {
+    const a = answers[k]
+    return a?.type === 'noul' ? a.noul : undefined
+  }
+  const requested = noul('requested')
+  const waiting = noul('waiting')
+  const promised = noul('promised')
+  if (requested === undefined || waiting === undefined || promised === undefined) return { verdict: 'error', reason: 'jev_unexpected_answer' }
+  const push = requested >= 0.5 && waiting < 1 - at && promised >= at
+  return { verdict: push ? 'push' : 'ok', requested, waiting, promised }
+}
+
+/** What Claude reads when a stop is refused: the promise, and a way out when something does block it. */
+export const DONE_NUDGE =
+  "Your last message says more work is coming, but nothing you started is still running and you are not waiting on the user. Carry on with the remaining work now. If something does block you, say plainly what it is and what you need."
+
+/** The done check in plain words, for the pane. */
+export function doneText(d: Pick<DoneCheck, 'verdict' | 'pushed'>, shadow: boolean): string {
+  switch (d.verdict) {
+    case 'push':
+      return d.pushed ? 'Claude stopped on a promise; Jev sent it back to work' : `Claude stopped on a promise; Jev would send it back to work${shadow ? ' (shadow)' : ''}`
+    case 'running':
+      return 'Claude left work running; no check needed'
+    case 'ok':
+      return 'Claude stopped with nothing promised'
+    case 'error':
+      return 'Jev could not check the stop'
+  }
+}
+
 // ---------------------------------------------------------------- the log
 
 export type TurnRecord = {
@@ -383,6 +460,8 @@ export type TurnRecord = {
     weekUsed?: number
   }
   jev?: JevTurn
+  /** The done check at the turn's last stop. */
+  done?: DoneCheck
 }
 
 export type LogRecord = TurnRecord
@@ -469,6 +548,16 @@ export function report(records: readonly LogRecord[], days: number): string {
     lines.push(`  over ${hint.length} hinted and ${control.length} control turns; medians, so compare similar work.`)
   } else {
     lines.push(`  ${hint.length} turns with hints, ${control.length} control: need ${MIN_GROUP} of each. Control turns come up on their own ("Jev: control group" in /config).`)
+  }
+  const checked = turns.filter(t => t.done && t.done.verdict !== 'error')
+  if (checked.length > 0) {
+    const would = checked.filter(t => t.done!.verdict === 'push')
+    const pushed = would.filter(t => t.done!.pushed)
+    const running = checked.filter(t => t.done!.verdict === 'running')
+    lines.push(
+      '',
+      `Done check: ${checked.length} stops checked · ${would.length} broken promises (${pct(would.length, checked.length)})${pushed.length < would.length ? `, ${would.length - pushed.length} only recorded (shadow)` : ''} · ${running.length} left work running.`,
+    )
   }
   lines.push('', ...economyLines(economy(records, days)))
   return lines.join('\n')

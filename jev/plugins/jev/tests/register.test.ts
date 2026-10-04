@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
-import { hintText } from '../hooks/logic'
+import { DONE_NUDGE, hintText } from '../hooks/logic'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare function setTimeout(callback: (value?: unknown) => void, ms: number): unknown
@@ -120,6 +120,7 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses, stopReason: toolUses.length ? ('tool_use' as const) : ('end_turn' as const), usage: null }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('classic.Stop', () => ({}))
   return w
 }
 
@@ -474,4 +475,102 @@ test("spend: Jev's price per call, Claude's cost and weekly quota per turn, in t
   expect(await pane.find({ text: /need 5 priced turns with hints and 5 control turns \(have 1 and 0\)/ })).toBeDefined()
   expect(await pane.find({ text: /Spent over 1 tracked turns: Claude \$0\.350 at API prices · Jev \$0\.0001 over 1 asks\./ })).toBeDefined()
   await pane.unmount()
+})
+
+/** Jev's answers to the done check's three questions. */
+const doneAnswer = (requested: number, waiting: number, promised: number) => ({
+  status: 200,
+  body: { answers: { requested: { type: 'noul', noul: requested }, waiting: { type: 'noul', noul: waiting }, promised: { type: 'noul', noul: promised } } },
+})
+
+/** A turn that ends with Claude's stop: the hint ask, one request, the stop, the end. */
+async function stoppingTurn($: Engine, w: World, last: string, stop: { tasks?: { status: string }[]; active?: boolean } = {}, turnId = 'turn-1') {
+  w.messages = () => [{ role: 'user', text: 'extract the contacts', toolUses: [] }]
+  await submit($, 'extract the contacts')
+  await $.turn.start({ text: 'extract the contacts', turnId })
+  await step($, turnId, 0)
+  const stopped = await $.classic.Stop({
+    stop_hook_active: stop.active ?? false,
+    last_assistant_message: last,
+    background_tasks: (stop.tasks ?? []).map((t, i) => ({ id: `t${i}`, type: 'shell', description: 'job', ...t })),
+    session_crons: [],
+  })
+  await complete($, w, turnId)
+  return stopped
+}
+
+test('done check in shadow: a promise with nothing running is recorded, and Claude is not stopped', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
+  const stopped = await stoppingTurn($, w, "The run is underway. I'll report when it lands.")
+  expect(stopped.block).toBeUndefined()
+  expect(Object.keys(w.asks[1]!.questions)).toEqual(['requested', 'waiting', 'promised'])
+  // the stop's own message is part of what Jev reads
+  expect(w.asks[1]!.state.conversation.at(-1)).toEqual({ role: 'assistant', text: "The run is underway. I'll report when it lands." })
+  expect(logged(w)[0].done).toMatchObject({ verdict: 'push', pushed: false, promised: 0.96 })
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /done check · Claude stopped on a promise; Jev would send it back to work \(shadow\)/ })).toBeDefined()
+  expect(await pane.find({ text: /Done check: 1 stops checked · 1 broken promises \(100%\), 1 only recorded \(shadow\)/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('done check on: the broken promise sends Claude back to work, once per turn', { options: { controlPercent: 0, doneCheck: 'on' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
+  w.messages = () => [{ role: 'user', text: 'extract the contacts', toolUses: [] }]
+  await submit($, 'extract the contacts')
+  await $.turn.start({ text: 'extract the contacts', turnId: 'turn-1' })
+  await step($, 'turn-1', 0)
+  const first = await $.classic.Stop({ stop_hook_active: false, last_assistant_message: "I'll keep extracting.", background_tasks: [], session_crons: [] })
+  expect(first.block).toBe(DONE_NUDGE)
+  const asked = w.asks.length
+  // the stop that follows the push is never checked again
+  const second = await $.classic.Stop({ stop_hook_active: true, last_assistant_message: 'Done: 120 contacts imported.', background_tasks: [], session_crons: [] })
+  expect(second.block).toBeUndefined()
+  expect(w.asks).toHaveLength(asked)
+  await complete($, w, 'turn-1')
+  expect(logged(w)[0].done).toMatchObject({ verdict: 'push', pushed: true })
+})
+
+test('done check: work left running keeps the promise, and Jev is not asked', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  const stopped = await stoppingTurn($, w, "I'll report when the job finishes.", { tasks: [{ status: 'running' }] })
+  expect(stopped.block).toBeUndefined()
+  expect(w.asks).toHaveLength(1) // the hint ask only
+  expect(logged(w)[0].done).toEqual({ verdict: 'running', pushed: false })
+})
+
+test('done check: a finished report, or Claude waiting on the user, lets the stop through', { options: { controlPercent: 0, doneCheck: 'on' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.02, 0.1))
+  expect((await stoppingTurn($, w, 'Done: all 120 contacts imported.')).block).toBeUndefined()
+  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.6, 0.95))
+  expect((await stoppingTurn($, w, 'Which list should I import next?', {}, 'turn-2')).block).toBeUndefined()
+  expect(logged(w).map(r => r.done.verdict)).toEqual(['ok', 'ok'])
+})
+
+test('done check: Jev failing lets the stop through', { options: { controlPercent: 0, doneCheck: 'on' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push(answer('Bash'), { status: 401 })
+  expect((await stoppingTurn($, w, "I'll keep going.")).block).toBeUndefined()
+  expect(logged(w)[0].done).toMatchObject({ verdict: 'error', pushed: false })
+})
+
+test('done check off: stops are never checked', { options: { controlPercent: 0, doneCheck: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  await stoppingTurn($, w, "I'll keep going.")
+  expect(w.asks).toHaveLength(1)
+  expect(logged(w)[0].done).toBeUndefined()
 })

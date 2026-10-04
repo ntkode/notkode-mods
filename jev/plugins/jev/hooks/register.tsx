@@ -11,7 +11,11 @@ import {
   buildState,
   cardFor,
   cleanPrompt,
+  DONE_NUDGE,
+  DONE_QUESTIONS,
   decide,
+  doneText,
+  doneVerdict,
   decisionText,
   dollars,
   jevCost,
@@ -42,7 +46,7 @@ import {
   turnsFrom,
   upsertEnv,
 } from './logic'
-import type { Answer, Arm, Decision, Spend, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
+import type { Answer, Arm, Decision, DoneCheck, Spend, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
 import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, STILL, rasterCells, scenePixels } from './sprites'
 import type { Card, Scene, SceneState } from './sprites'
 
@@ -89,6 +93,8 @@ type Turn = {
   step?: Step
   /** The session's cost and weekly quota when the turn started. */
   before?: Usage
+  /** The done check at the turn's last stop, while it runs and once it is in. */
+  done?: Promise<DoneCheck | undefined>
 }
 
 /** The session's cost so far (US dollars, API prices) and the weekly quota used (percent). */
@@ -107,6 +113,7 @@ async function usageNow($: $): Promise<Usage> {
 // The options, read at each load.
 let mode: 'on' | 'shadow' | 'off' = 'on'
 let controlPercent = 20
+let doneMode: 'shadow' | 'on' | 'off' = 'shadow'
 let excludedRepos = ''
 
 // The session's facts, worked out at session.start (which a reload fires again).
@@ -288,6 +295,37 @@ async function consult($: $, jev: JevTurn, arm: JevArm, rows: readonly MessageRo
   return d
 }
 
+// ------------------------------------------------------------ the done check
+
+type StopEvent = { stop_hook_active: boolean; last_assistant_message?: string; background_tasks?: readonly { status: string }[]; session_crons?: readonly unknown[] }
+
+/**
+ * At Claude's stop: is it a broken promise? Background work or a scheduled wake-up keeps the
+ * promise, so Jev is asked only when nothing is pending. Never throws: a failed check lets the stop through.
+ */
+async function checkStop($: $, e: StopEvent): Promise<DoneCheck> {
+  const pending = (e.background_tasks ?? []).filter(t => t.status === 'running' || t.status === 'pending').length + (e.session_crons?.length ?? 0)
+  if (pending > 0) return { verdict: 'running', pushed: false }
+  const a = access
+  if (!a) return { verdict: 'error', pushed: false, reason: 'jev_error: no key' }
+  const started = await $.clock.now()
+  const spend: Spend = { calls: 0, priced: 0 }
+  try {
+    const rows = await conversationRows($)
+    const last = e.last_assistant_message?.trim()
+    // The stop's own message may not be stored yet.
+    if (last && rows.at(-1)?.text.trim() !== last) rows.push({ role: 'assistant', text: last, toolUses: [] })
+    const work = askJev($, a, buildState(turnsFrom(rows)), DONE_QUESTIONS, spend)
+    const answers = await within($, work, JEV_TIMEOUT_MS)
+    const ms = (await $.clock.now()) - started
+    if (!answers) return { verdict: 'error', pushed: false, reason: 'jev_timeout', ms }
+    const v = doneVerdict(answers)
+    return { ...v, pushed: v.verdict === 'push' && doneMode === 'on', ms, ...(spend.usd !== undefined ? { usd: spend.usd } : {}) }
+  } catch (error) {
+    return { verdict: 'error', pushed: false, reason: `jev_error: ${message(error)}` }
+  }
+}
+
 // ------------------------------------------------------------ the band above the prompt
 
 /**
@@ -463,6 +501,7 @@ type TurnEnd = {
 }
 
 async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<void> {
+  const done = turn.done ? await within($, turn.done, JEV_TIMEOUT_MS + 1000) : undefined
   const after = await usageNow($)
   const before = turn.before ?? {}
   const delta = (a?: number, b?: number) => (a !== undefined && b !== undefined ? Math.max(0, Math.round((a - b) * 1e6) / 1e6) : undefined)
@@ -491,6 +530,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
       ...(after.week !== undefined ? { weekUsed: after.week } : {}),
     },
     ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
+    ...(done ? { done } : {}),
   }
   await log($, record)
   await publish($, record)
@@ -525,6 +565,7 @@ async function publish($: $, record: TurnRecord): Promise<void> {
           },
         }
       : {}),
+    ...(record.done ? { done: { verdict: record.done.verdict, pushed: record.done.pushed } } : {}),
   }
   const hinting = record.arm === 'hint'
   await update($, lastView, () => view)
@@ -644,6 +685,11 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
           <Box flexDirection="column">
             {last.prompt ? <Text dimColor italic wrap="truncate-end">“{cleanPrompt(last.prompt)}”</Text> : null}
             {ARM_TEXT[last.arm] ? <Text dimColor>{ARM_TEXT[last.arm]}</Text> : null}
+            {last.done ? (
+              <Text color={last.done.verdict === 'push' ? (last.done.pushed ? 'cyan' : 'yellow') : undefined} dimColor={last.done.verdict !== 'push'}>
+                done check · {doneText(last.done, doneMode === 'shadow')}
+              </Text>
+            ) : null}
             {lj ? (
               <Box flexDirection="column" marginTop={1}>
                 {lj.cards.length > 0 ? (
@@ -903,6 +949,7 @@ async function setup($: $, cwd: string): Promise<string> {
 
 export const register: Register = (on, options) => {
   mode = options.mode === 'off' || options.mode === 'shadow' ? options.mode : 'on'
+  doneMode = options.doneCheck === 'on' || options.doneCheck === 'off' ? options.doneCheck : 'shadow'
   controlPercent = typeof options.controlPercent === 'number' && options.controlPercent >= 0 && options.controlPercent <= 100 ? options.controlPercent : 20
   excludedRepos = typeof options.excludedRepos === 'string' ? options.excludedRepos : ''
   let cwd = ''
@@ -1010,6 +1057,20 @@ export const register: Register = (on, options) => {
     if (d.mode !== 'hint' || !d.tool) return result
     turn.pending = d.tool
     return turn.arm === 'hint' ? { ...result, context: [...(result.context ?? []), hintText(d.tool)] } : result
+  })
+
+  // Claude's stop: a promise of more work with nothing running sends it back to work (or, in shadow, is recorded).
+  on('classic.Stop', async ($, e, next) => {
+    const result = await next(e)
+    const turn = current ? turns.get(current) : undefined
+    // The main loop only, Jev's turns only, and never a stop that a push already caused.
+    if (doneMode === 'off' || e.agent_id || e.stop_hook_active || !turn || (turn.arm !== 'hint' && turn.arm !== 'shadow' && turn.arm !== 'control') || result.block) return result
+    const done = checkStop($, e)
+    turn.done = done
+    const d = await done
+    if (!d.pushed) return result
+    $.ui.toast('Jev: Claude stopped on a promise with nothing running, so it was sent back to work.')
+    return { ...result, block: DONE_NUDGE }
   })
 
   on('turn.complete', ($, e, next) => {

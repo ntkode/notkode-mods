@@ -30,6 +30,10 @@ watch it happen and measure whether it helps on your own work.
   and Jev's calls as the provider prices them) and how much of your weekly quota is used. Once 5
   turns with hints and 5 control turns are logged, it estimates what hints saved per turn, in
   dollars and as a share of the weekly quota, net of Jev's cost.
+- **Catches a stop on a broken promise** (done check). When Claude stops after saying more work
+  is coming ("I'll report when it lands"), with nothing left running and nothing asked of you, Jev
+  catches it. In `shadow` (the default) it is only recorded in `/jev`; set it `on` and Claude is
+  sent back to work, once per turn. Backtested on 14 days of real turns before shipping.
 - **Respects private work.** Repos you exclude never ask Jev, so their conversations never reach
   it, and their prompts stay out of the plugin's log.
 
@@ -81,6 +85,7 @@ In `/config`, under the plugin:
 |---|---|---|
 | Jev: hints | `on` | `on`: Claude gets Jev's confident picks. `shadow`: Jev is asked and its picks are recorded, but Claude never sees them. `off`: Jev is never asked |
 | Jev: control group (%) | `20` | with hints on, this share of turns runs without Jev, for the `/jev` pane to compare. `0` turns it off |
+| Jev: done check | `shadow` | `shadow`: broken promises are recorded in `/jev`. `on`: Claude is sent back to work, once per turn. `off`: stops are never checked |
 | Jev: excluded repos | empty | comma-separated folder names where Jev is never asked |
 
 Options are stored per install: a marketplace install (`jev@notkode-mods`) and a `--plugin-dir` copy

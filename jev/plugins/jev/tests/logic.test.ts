@@ -11,6 +11,7 @@ import {
   cleanPrompt,
   decide,
   decisionText,
+  doneVerdict,
   dollars,
   economy,
   economyLines,
@@ -182,6 +183,17 @@ describe('turns and decisions', () => {
     tally(j, { mode: 'pass', reason: 'low_confidence', confidence: 0.4 }, 300)
     tally(j, { mode: 'pass', reason: 'jev_error: HTTP 500' }, 90)
     expect(j).toEqual({ asked: 3, hinted: 1, followed: 0, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1, jev_error: 1 }, ms: [240, 300, 90], cards: ['pick', 'pass', 'fail'], usd: 0, unpriced: 0 })
+  })
+})
+
+describe('the done check', () => {
+  const n = (requested: number, waiting: number, promised: number): Record<string, Answer> => ({ requested: needs(requested), waiting: needs(waiting), promised: needs(promised) })
+  test('pushes only a confident promise of more work, on requested work, with Claude not waiting on the user', () => {
+    expect(doneVerdict(n(0.95, 0.05, 0.95)).verdict).toBe('push')
+    expect(doneVerdict(n(0.95, 0.05, 0.85)).verdict).toBe('ok')
+    expect(doneVerdict(n(0.95, 0.2, 0.95)).verdict).toBe('ok')
+    expect(doneVerdict(n(0.3, 0.05, 0.95)).verdict).toBe('ok')
+    expect(doneVerdict({ requested: needs(0.9) })).toMatchObject({ verdict: 'error', reason: 'jev_unexpected_answer' })
   })
 })
 
