@@ -33,7 +33,8 @@ watch it happen and measure whether it helps on your own work.
 - **Catches a stop on a broken promise** (done check). When Claude stops after saying more work
   is coming ("I'll report when it lands"), with nothing left running and nothing asked of you, Jev
   catches it. In `shadow` (the default) it is only recorded in `/jev`; set it `on` and Claude is
-  sent back to work, once per turn. Backtested on 14 days of real turns before shipping.
+  sent back to work, once per turn. Switch it from the `/jev` pane (`d`) or in `/config`.
+  Backtested on 14 days of real turns before shipping.
 - **Respects private work.** Repos you exclude never ask Jev, so their conversations never reach
   it, and their prompts stay out of the plugin's log.
 
@@ -74,8 +75,8 @@ the key is never shown or passed on a command line. Keys in the environment (`OP
 `TYPESAFE_API_KEY`, …) work too and win over the file.
 
 Open the pane with `/jev`. It shows where Jev runs, what it answered on the last turn, the session's
-totals and spend, the last 7 days (what Jev answered, hints vs control, spend and savings), and a
-switch to pause Jev for this session.
+totals and spend, the last 7 days (what Jev answered, hints vs control, spend and savings), and
+switches to pause Jev for this session and to set the done check (shadow, on, off).
 
 ## Settings
 

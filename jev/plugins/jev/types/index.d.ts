@@ -88,6 +88,8 @@ declare module 'claude-code' {
         gateway?: string
         /** Jev is not asked in this session until it is resumed (the pane's switch). */
         paused?: boolean
+        /** The done check's mode, as /config or the pane's switch set it. */
+        doneCheck?: 'shadow' | 'on' | 'off'
       }
       last: JevTurnView | null
       session: JevSessionView

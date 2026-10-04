@@ -195,6 +195,7 @@ async function configure($: $, cwd: string): Promise<void> {
     ...(access ? { provider: PROVIDERS[access.provider].label } : {}),
     ...(gateway ? { gateway } : {}),
     ...(before.paused ? { paused: true } : {}),
+    doneCheck: doneMode,
   }))
 }
 
@@ -652,6 +653,14 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
           asked before each of Claude's requests · hints at ≥ 0.7 · {controlPercent}% control turns
         </Text>
       ) : null}
+      {ready ? (
+        <Text wrap="truncate-end">
+          <Text dimColor>done check  </Text>
+          <Text color={(s.doneCheck ?? doneMode) === 'on' ? 'cyan' : undefined} dimColor={(s.doneCheck ?? doneMode) === 'off'}>
+            {DONE_MODE_TEXT[s.doneCheck ?? doneMode]}
+          </Text>
+        </Text>
+      ) : null}
       {s.gateway ? (
         <Text color="yellow" wrap="wrap">
           This session's requests go through a local proxy ({s.gateway}). If it is jev-gateway, it hints too: run one or the other to measure either.
@@ -813,11 +822,37 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
         {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
         {ready ? <Button key="pause" hotkey="p" plain label={s.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !s.paused)} /> : null}
+        {ready ? <Button key="done" hotkey="d" plain label={`done check: ${DONE_NEXT[s.doneCheck ?? doneMode]}`} onPress={() => cycleDoneCheck($)} /> : null}
         {/* the terminal's pane has its own ✕ */}
         {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
     </Box>
   )
+}
+
+const DONE_NEXT = { shadow: 'on', on: 'off', off: 'shadow' } as const
+const DONE_MODE_TEXT = {
+  shadow: 'shadow · broken promises are only recorded',
+  on: 'on · Claude is sent back to work',
+  off: 'off · stops are not checked',
+} as const
+
+/** Moves the done check to its next mode, saved in /config like the menu would. */
+async function cycleDoneCheck($: $): Promise<void> {
+  const value = DONE_NEXT[doneMode]
+  try {
+    const row = (await $.config.list()).find(r => r.key.endsWith('.doneCheck') && r.key.startsWith('jev'))
+    const written = row ? await $.config.set({ key: row.key, value }) : { deny: 'the option is not in /config' }
+    if (written.deny !== undefined) {
+      $.ui.toast(`Jev: the done check stays ${doneMode} (${written.deny}).`)
+      return
+    }
+  } catch (error) {
+    $.ui.toast(`Jev: the done check stays ${doneMode} (${message(error)}).`)
+    return
+  }
+  doneMode = value
+  await update($, status, s => ({ ...s, doneCheck: value }))
 }
 
 /** `Mon 14:00` for a reset time. */

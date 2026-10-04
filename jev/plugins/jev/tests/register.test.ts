@@ -46,13 +46,15 @@ type World = {
   toolHold?: Promise<void>
   /** What `$.session.usage()` reports: the session's cost and the weekly quota used. */
   usage: { usd: number; week?: number }
+  /** Options the mod wrote through $.config.set. */
+  configSets: string[]
 }
 
 type Setup = { key?: boolean; env?: Record<string, string> }
 
 /** The world beneath the plugin: the environment, files, the conversation, Jev's API, the model, the tools, the clipboard. */
 function world(on: On, clock: MockClock, setup: Setup = {}): World {
-  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [], usage: { usd: 0 } }
+  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [], usage: { usd: 0 }, configSets: [] }
   if (setup.key !== false) w.files[KEY_FILE] = `JEV_PROVIDER=openrouter\nOPENROUTER_API_KEY=${KEY}\n`
 
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
@@ -121,6 +123,13 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('classic.Stop', () => ({}))
+  const config: Record<string, unknown> = { 'jev.doneCheck': 'shadow' }
+  on('config.list', () => ({ value: Object.entries(config).map(([key, value]) => ({ key, value })) as never }))
+  on('config.set', (_$, e) => {
+    config[e.key] = e.value
+    w.configSets.push(`${e.key}=${String(e.value)}`)
+    return { value: e.value }
+  })
   return w
 }
 
@@ -573,4 +582,20 @@ test('done check off: stops are never checked', { options: { controlPercent: 0, 
   await stoppingTurn($, w, "I'll keep going.")
   expect(w.asks).toHaveLength(1)
   expect(logged(w)[0].done).toBeUndefined()
+})
+
+test('the pane switches the done check: shadow → on → off, saved in /config, and on takes effect at once', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /done check +shadow · broken promises are only recorded/ })).toBeDefined()
+  await pane.press({ key: 'done' })
+  expect(w.configSets).toEqual(['jev.doneCheck=on'])
+  expect(await pane.find({ text: /on · Claude is sent back to work/ })).toBeDefined()
+  expect(await pane.find({ type: 'Button', key: 'done', text: 'done check: off' })).toBeDefined()
+  await pane.unmount()
+
+  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
+  expect((await stoppingTurn($, w, "I'll keep extracting.")).block).toBe(DONE_NUDGE)
 })
