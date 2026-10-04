@@ -16,7 +16,7 @@ jevMod is a **standalone, open-source Claude Code plugin** (`jev`), distributed 
 2. **Then: research.** New Jev use cases found online go through the funnel in `CLAUDE.md`:
    backtest on real transcripts, then shadow, then live with a control group, then keep or drop.
 
-## Current state: v0.5 works, not released
+## Current state: v0.5, released
 
 v0.5 drops the gateway. jev-gateway's only effect in Claude Code was a hint (with thinking on, the
 API refuses a forced tool, and touching `tool_choice` breaks the prompt cache), yet it took Node,
@@ -81,8 +81,8 @@ external `jev-claude` mode, excluded repos, the marketplace install from GitHub.
       Check a confident pick reaches Claude as `context` and shows cyan.
 - [ ] **Windows.** Untested: `USERPROFILE` fallback, PowerShell clipboard, backslash paths in
       exclusions, no `chmod`. Needs one real run.
-- [ ] **Make the repository public** (`ntkode/notkode-mods`, which now holds jev too, is
-      private for now).
+- [x] **Repository public** (`ntkode/notkode-mods`, 2026-10-03): checked for secrets and private
+      data first; installs anonymously with the README's two commands.
 - [ ] `/jev-setup` driven end to end on a clean machine (the dialog flow ran in tests only).
 - [ ] Linux clipboard (`wl-paste`, `xclip`) untested.
 
@@ -99,7 +99,7 @@ external `jev-claude` mode, excluded repos, the marketplace install from GitHub.
 1. See a hint live (above); then release v0.5.0 (the marketplace description and the root README
    row already describe it).
 2. Run it on Windows once; fix what breaks.
-3. Make the repository public; install on a second machine; drive `/jev-setup` there.
+3. Install on a second machine; drive `/jev-setup` there.
 4. Use it: read `/jev-report` once hints and control have 5 turns each. That is idea 1's live
    stage; write `research/results/07-…` with the numbers.
 5. Open the issues drafted in `research/upstream/jev-gateway.md` that still apply (README link,

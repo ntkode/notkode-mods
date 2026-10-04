@@ -4,7 +4,7 @@
 decision model, which tool fits Claude's next step, and passes Claude the answer as a hint. You can
 watch it happen and measure whether it helps on your own work.
 
-> **Status: v0.5, working, not released yet.** Native to Claude Code: no gateway, no proxy, no
+> **Status: v0.5, released.** Native to Claude Code: no gateway, no proxy, no
 > Node.js. Tested on macOS, headless and interactive. Windows is untested. See [PLAN.md](PLAN.md).
 > Independent project; the questions and the decision rule are ported from
 > [jev-gateway](https://github.com/vinilana/jev-gateway) (MIT). Not affiliated with TypeSafe.
