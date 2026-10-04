@@ -1,0 +1,10 @@
+# Written by Claude Code each time it loads the plugin; regenerated, never edited
+plugins/*/.claude-plugin/types/
+plugins/*/tsconfig.json
+
+# Backtest data: holds real prompts from your own transcripts. Never commit it.
+research/backtest/data/
+
+node_modules/
+.DS_Store
+__pycache__/
