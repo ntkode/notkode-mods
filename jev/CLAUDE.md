@@ -7,7 +7,7 @@ state and the next steps.
 
 ## Layout
 
-- Distribution: the [notkode-mods](https://github.com/ntkode/notkode-mods) marketplace lists `plugins/jev` (a `git-subdir` entry), so users install with `/plugin install jev@notkode-mods`. This repo has no marketplace of its own.
+- Distribution: jev lives in the [notkode-mods](https://github.com/ntkode/notkode-mods) repository, under `jev/`. Its marketplace (`.claude-plugin/marketplace.json` at the repository root) lists `./jev/plugins/jev`, so users install with `/plugin install jev@notkode-mods`. Paths below are relative to `jev/`.
 - `plugins/jev/`: the plugin
   - `.claude-plugin/plugin.json`: manifest and `userConfig` (the `/config` rows)
   - `hooks/register.tsx`: the hooks module (`register(on, options)`)

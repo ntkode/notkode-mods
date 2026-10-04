@@ -13,22 +13,23 @@ Update the list with `/plugin marketplace update notkode-mods`.
 
 | Plugin | What it does | Source |
 |---|---|---|
-| `jev` | Runs [jev-gateway](https://github.com/vinilana/jev-gateway) from inside Claude Code: Jev, TypeSafe's fast decision model, picks the next tool on each request, shown live and measured against a baseline. After installing, run `/jev-setup`. | [jevMod](https://github.com/tone-lotto/jevMod) |
+| `jev` | Runs [jev-gateway](https://github.com/vinilana/jev-gateway) from inside Claude Code: Jev, TypeSafe's fast decision model, picks the next tool on each request, shown live and measured against a baseline. After installing, run `/jev-setup`. | [`jev/`](jev/) |
 
 ## Adding a plugin
 
-Each plugin lives in its own repository. Add an entry to `.claude-plugin/marketplace.json`:
+Every Notkode mod lives in this repository, one top-level folder per mod (`jev/`, …). The folder
+holds the mod's docs and research, and its plugin under `plugins/<plugin>/`. Add an entry to
+`.claude-plugin/marketplace.json`:
 
 ```json
 {
   "name": "my-plugin",
   "description": "One line on what it does",
-  "source": { "source": "git-subdir", "url": "https://github.com/<owner>/<repo>.git", "path": "<folder with .claude-plugin/plugin.json>", "ref": "main" }
+  "source": "./my-mod/plugins/my-plugin"
 }
 ```
 
-- Use the full `https://` URL. The `owner/repo` shorthand clones over SSH, which fails for anyone
-  without an SSH key on GitHub.
-- For a plugin at the root of its repository, use `{ "source": "github", "repo": "<owner>/<repo>" }`.
+- The path is relative to this repository's root and starts with `./`. Only that plugin folder is
+  copied to users' machines, so keep research and private data outside it.
 - Check it with `claude plugin validate .`, then push. Installed copies are cached by the plugin's
   `version` in its own `plugin.json`, so raise that for each release.

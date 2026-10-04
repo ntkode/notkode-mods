@@ -1,8 +1,8 @@
 # Drafts for jev-gateway's maintainer
 
 Issues to open on [vinilana/jev-gateway](https://github.com/vinilana/jev-gateway), one each.
-Drafts only: nothing here has been sent. Open them once jevMod's repository is public, so the
-links work.
+Drafts only: nothing here has been sent. Open them once the notkode-mods repository (which
+holds jevMod) is public, so the links work.
 
 ---
 

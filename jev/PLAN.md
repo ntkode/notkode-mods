@@ -84,7 +84,7 @@ jev-gateway 0.5.0 with an OpenRouter key.
 - [ ] **Windows.** Untested. Designed for it: `node` with no shell, the gateway's own launcher
       (cross-platform), `npm` → `npm.cmd` → `cmd /c npm`, `USERPROFILE` fallback, PowerShell
       clipboard, backslash paths in exclusions. Needs one real run.
-- [ ] **Make both repositories public** (`tone-lotto/jevMod` and `ntkode/notkode-mods` are
+- [ ] **Make the repository public** (`ntkode/notkode-mods`, which now holds jev too, is
       private for now).
 - [ ] `/jev-setup` itself driven end to end on a clean machine (its parts ran for real: npm
       install, launcher, save-key's gateway code; the dialog flow ran in tests only).

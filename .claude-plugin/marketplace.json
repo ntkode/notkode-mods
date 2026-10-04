@@ -9,12 +9,7 @@
     {
       "name": "jev",
       "description": "Runs jev-gateway from inside Claude Code: Jev picks the next tool on each request, shown live and measured against a baseline",
-      "source": {
-        "source": "git-subdir",
-        "url": "https://github.com/tone-lotto/jevMod.git",
-        "path": "plugins/jev",
-        "ref": "main"
-      },
+      "source": "./jev/plugins/jev",
       "category": "productivity",
       "keywords": ["jev", "typesafe", "jev-gateway", "tool-routing", "mod"]
     }

@@ -45,7 +45,7 @@ Code:
 /plugin install jev@notkode-mods
 ```
 
-To work on the plugin itself, run a clone instead: `claude --plugin-dir path/to/jevMod/plugins/jev`
+To work on the plugin itself, run a clone instead: `claude --plugin-dir path/to/notkode-mods/jev/plugins/jev`
 (the folder hot-reloads on save).
 
 Then:
