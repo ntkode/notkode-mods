@@ -8,10 +8,10 @@
   "plugins": [
     {
       "name": "jev",
-      "description": "Runs jev-gateway from inside Claude Code: Jev picks the next tool on each request, shown live and measured against a baseline",
+      "description": "Jev, TypeSafe's fast decision model, picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group",
       "source": "./jev/plugins/jev",
       "category": "productivity",
-      "keywords": ["jev", "typesafe", "jev-gateway", "tool-routing", "mod"]
+      "keywords": ["jev", "typesafe", "tool-routing", "mod"]
     }
   ]
 }

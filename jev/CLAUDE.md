@@ -1,9 +1,9 @@
 # jevMod
 
 An open-source Claude Code plugin (a "mod": function hooks, not just skills) that brings Jev,
-TypeSafe's fast decision model, into Claude Code. Its first feature runs jev-gateway from inside
-the session. Read `PLAN.md` first: it holds the decisions, what has been proven, the current code
-state and the next steps.
+TypeSafe's fast decision model, into Claude Code. Since v0.5 it asks Jev itself, before Claude's
+requests, and passes Claude a hint (no gateway, no proxy). Read `PLAN.md` first: it holds the
+decisions, what has been proven, the current code state and the next steps.
 
 ## Layout
 
@@ -11,8 +11,8 @@ state and the next steps.
 - `plugins/jev/`: the plugin
   - `.claude-plugin/plugin.json`: manifest and `userConfig` (the `/config` rows)
   - `hooks/register.tsx`: the hooks module (`register(on, options)`)
-  - `hooks/logic.ts`, `hooks/sprites.ts`: pure code, no `$`, tested directly
-  - `scripts/save-key.mjs`: run with `node` by `/jev-setup`; checks and saves the Jev key through the gateway's own `bin/setup.mjs` (key on stdin, never argv)
+  - `hooks/logic.ts`: pure code, no `$`, tested directly: Jev's questions and decision rule (ported from jev-gateway), the key file, the log, the report
+  - `hooks/sprites.ts`: the band's pixel scenes, pure. Rule: only the actor doing the work moves (the owl only while Jev decides, Claude while it thinks or runs tools), and information shows as a particle only while it travels
   - `types/index.d.ts`: the `$.state` contract
   - `tests/*.test.ts`: run with `claude plugin test`
   - `experiments/`: new use cases, each off by default (create when the first one lands)
@@ -50,6 +50,10 @@ Grep it for the event or noun at hand rather than guessing.
   `env.set` over one object itself. A `tool.call` carries the tool's arguments at the top level
   (`e.questions` for the dialog `$.ui.ask` opens), not under `e.input`. A band that returns
   `next(e)` needs a `ui.render` hook beneath it in the test.
+- `tool.call`'s `e` is a union in which one member (from the generated MCP typings) lacks `tool`
+  and `tool_use_id`: read them through a cast (`e as unknown as { tool: string; tool_use_id: string }`).
+- `$.clock.sleep` runs on the mock clock in tests: code that sleeps (a retry's pause, a time budget)
+  waits until the test calls `clock.advance`.
 - Interactive checks: run the session in tmux. `send-keys Enter` does not submit there; send a
   raw carriage return (`tmux send-keys -l $'\r'`).
 - Tests: hooks beneath the plugin must be registered before the test's first `$` call. Op events
@@ -74,5 +78,5 @@ Every new use case, especially ones found online, goes through these steps befor
 4. Live with a control group, then keep it (move into the core) or drop it.
 5. Write `research/results/NN-name.md`: numbers, verdict, and why. A failed idea is a result too.
 
-Experiments stay off by default and separate from the gateway integration, so a half-tested idea
+Experiments stay off by default and separate from the hints, so a half-tested idea
 can never break the part people rely on.

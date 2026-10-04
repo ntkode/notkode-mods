@@ -2,52 +2,56 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
 
+import { hintText } from '../hooks/logic'
+
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare function setTimeout(callback: (value?: unknown) => void, ms: number): unknown
 
 const KEY = 'sk-or-v1-test0123456789abcdef0123456789'
 const UNCUT = { isStdoutTruncated: false, isStderrTruncated: false }
 const HOME = '/home/t'
-const GATEWAY = 'http://127.0.0.1:8794'
-const JEV_CLAUDE = 'http://127.0.0.1:8789'
-const PACKAGE = `${HOME}/.claude/jev-mod/gateway/0.5.0/node_modules/jev-gateway`
 const KEY_FILE = `${HOME}/.jev-gateway/.env`
 const LOG_DIR = `${HOME}/.claude/jev-mod/log`
+const JEV_URL = 'https://openrouter.ai/api/alpha/decisions'
+const TOOLS = [
+  { name: 'Read', description: 'Reads a file.', mcp: false },
+  { name: 'Bash', description: 'Runs a shell command.', mcp: false },
+]
 
-type Run = { argv: string[]; env?: Record<string, string>; stdin?: string }
+/** Jev's answer: `tool` at `confidence`, and "a tool is needed" at `noul`. */
+const answer = (tool: string, confidence = 0.9, noul = 0.8) => ({
+  status: 200,
+  body: { answers: { tool: { type: 'choice', choice: tool, confidence, probabilities: { [tool]: confidence } }, needs_tool: { type: 'noul', noul } } },
+})
+
+type JevReply = { status: number; body?: unknown; hold?: Promise<void> }
+type Row = { role: 'user' | 'assistant'; text: string; toolUses: { tool_use_id: string; tool: string; input: Record<string, unknown>; text?: string }[] }
 
 type World = {
   env: Record<string, string | undefined>
   files: Record<string, string>
-  runs: Run[]
-  /** ANTHROPIC_BASE_URL as each model request went out. */
-  sentTo: (string | undefined)[]
-  toasts: string[]
-  /** What the person picks in the next questions, in order. */
+  runs: string[][]
   answers: string[]
-  gateway: { at: string; up: boolean; startable: boolean; routing: boolean; startedAt: string; upstream?: string; events: Record<string, unknown>[] }
-  routingPosts: string[]
-  /** While set, a model request stays in flight until it resolves. */
-  hold?: Promise<void>
+  /** The conversation `$.session.messages()` returns, built when asked. */
+  messages: () => Row[]
+  /** What each call to Jev carried. */
+  asks: { state: { conversation: unknown[] }; questions: Record<string, unknown>; model: string; auth: string }[]
+  /** Jev's next replies, in order; once empty, Jev hints Read. */
+  jev: JevReply[]
+  /** The tools each model response calls, in order; once empty, it ends the turn. */
+  responses: { name: string; input: Record<string, unknown> }[][]
+  /** The ids the engine gave each tool call. */
+  toolUseIds: string[]
+  /** While set, a tool call stays running until it resolves. */
+  toolHold?: Promise<void>
 }
 
-type Setup = { installed?: boolean; key?: boolean; env?: Record<string, string>; gatewayAt?: string; up?: boolean; frames?: string[] }
+type Setup = { key?: boolean; env?: Record<string, string> }
 
-/** The world beneath the plugin: the environment, files, the gateway's launcher and its HTTP API, npm, the clipboard. */
+/** The world beneath the plugin: the environment, files, the conversation, Jev's API, the model, the tools, the clipboard. */
 function world(on: On, clock: MockClock, setup: Setup = {}): World {
-  const w: World = {
-    env: { HOME, ...setup.env },
-    files: {},
-    runs: [],
-    sentTo: [],
-    toasts: [],
-    answers: [],
-    gateway: { at: setup.gatewayAt ?? GATEWAY, up: setup.up ?? false, startable: true, routing: true, startedAt: 'start-0', events: [] },
-    routingPosts: [],
-  }
-  if (setup.installed !== false) w.files[`${PACKAGE}/package.json`] = JSON.stringify({ name: 'jev-gateway', version: '0.5.0' })
+  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [] }
   if (setup.key !== false) w.files[KEY_FILE] = `JEV_PROVIDER=openrouter\nOPENROUTER_API_KEY=${KEY}\n`
-  let starts = 0
 
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
   on('env.set', (_$, e) => {
@@ -64,79 +68,46 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
       .filter(path => path.startsWith(`${e.path}/`))
       .map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: w.files[path]!.length, mtimeMs: clock.now(), isLink: false })),
   }))
-
   on('process.run', (_$, e) => {
     const argv = [...e.argv]
-    w.runs.push({ argv, ...(e.init?.env ? { env: e.init.env } : {}), ...(e.init?.stdin !== undefined ? { stdin: e.init.stdin } : {}) })
-    const out = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, ...UNCUT } })
-    if (argv[0] === 'node' && argv[1] === '--version') return out('v22.20.0\n')
-    if (argv[0] === 'node' && argv[1] === `${PACKAGE}/bin/jev-claude.mjs`) {
-      if (argv[2] === '--stop') {
-        w.gateway.up = false
-        return out('jev-claude: stopped router (pid 4242).')
-      }
-      if (!w.gateway.startable) return out('', 1, 'jev-claude: the router did not start. Last log lines: …')
-      if (!w.gateway.up) {
-        w.gateway.up = true
-        w.gateway.startedAt = `start-${++starts}`
-        w.gateway.upstream = e.init?.env?.JEV_CLAUDE_UPSTREAM_BASE_URL
-      }
-      return out(`jev-claude: router up on ${GATEWAY}`)
-    }
-    if (argv[0] === 'npm') {
-      w.files[`${PACKAGE}/package.json`] = JSON.stringify({ name: 'jev-gateway', version: '0.5.0' })
-      return out('added 3 packages')
-    }
-    if (argv[0] === 'node' && argv[1]?.endsWith('/scripts/save-key.mjs')) {
-      const input = JSON.parse(e.init?.stdin ?? '{}') as { provider: string; key: string }
-      w.files[KEY_FILE] = `JEV_PROVIDER=${input.provider}\nOPENROUTER_API_KEY=${input.key}\n`
-      return out(`${JSON.stringify({ ok: true, ms: 280, file: KEY_FILE })}\n`)
-    }
+    w.runs.push(argv)
+    const out = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', ...UNCUT } })
     if (argv[0] === 'pbpaste') return out(`${KEY}\n`)
-    if (argv[0] === 'pbcopy') return out('')
+    if (argv[0] === 'pbcopy' || argv[0] === 'chmod') return out('')
     return { deny: `spawn ${argv[0]} ENOENT` }
   })
-
-  on('http.fetch', (_$, e) => {
-    const g = w.gateway
-    if (!e.url.startsWith(g.at) || !g.up) return { deny: 'connect ECONNREFUSED' }
-    const url = new URL(e.url)
-    const json = (body: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } })
-    if (url.pathname === '/health') return json({ status: 'ok', pid: 4242, upstream: g.upstream, jev: 'openrouter' })
-    if (url.pathname === '/dashboard/routing') {
-      w.routingPosts.push(e.url)
-      g.routing = url.searchParams.get('enabled') === 'true'
-      return json({ routing: g.routing })
-    }
-    if (url.pathname === '/dashboard/events') {
-      const since = Number(url.searchParams.get('since'))
-      const events = g.events.filter(ev => (ev.seq as number) > since)
-      return json({ router: { routing: g.routing, minConfidence: 0.7, recorded: g.events.length, startedAt: g.startedAt }, events })
-    }
-    return { value: { status: 404, ok: false, headers: {}, text: '' } }
+  on('http.fetch', async (_$, e) => {
+    if (e.url !== JEV_URL) return { deny: 'connect ECONNREFUSED' }
+    const body = JSON.parse(e.init?.body ?? '{}')
+    w.asks.push({ ...body, auth: e.init?.headers?.authorization ?? '' })
+    const reply: JevReply = w.jev.shift() ?? answer('Read')
+    if (reply.hold) await reply.hold
+    return { value: { status: reply.status, ok: reply.status < 400, headers: {}, text: JSON.stringify(reply.body ?? {}) } }
   })
 
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sess-1' }))
+  on('session.messages', () => ({ value: w.messages() as never }))
+  on('tool.list', () => ({ value: TOOLS }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('ui.toast', (_$, e) => {
-    w.toasts.push(e.text)
-    return { value: undefined }
-  })
+  on('ui.toast', () => ({ value: undefined }))
   on('ui.log', () => ({ value: undefined }))
-  on('ui.blit', (_$, e) => {
-    if ('cells' in e && e.key === 'jev-scene') setup.frames?.push(e.cells)
-    return { value: {} }
-  })
-  on('tool.call', { tool: 'AskUserQuestion' }, (_$, e) => {
-    const { questions } = e as unknown as { questions: { question: string }[] }
-    return { result: { questions, answers: { [questions[0]!.question]: w.answers.shift() ?? 'Cancel' } } } as never
+  on('ui.blit', () => ({ value: {} }))
+  on('prompt.submit', (_$, e) => ({ text: e.text, ...(e.context ? { context: e.context } : {}) }))
+  on('tool.call', async (_$, e) => {
+    const call = e as unknown as { tool: string; tool_use_id: string }
+    if (call.tool === 'AskUserQuestion') {
+      const { questions } = e as unknown as { questions: { question: string }[] }
+      return { result: { questions, answers: { [questions[0]!.question]: w.answers.shift() ?? 'Cancel' } } } as never
+    }
+    w.toolUseIds.push(call.tool_use_id)
+    if (w.toolHold) await w.toolHold
+    return { result: 'done', text: `${call.tool} result` } as never
   })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* (_$, e) {
-    w.sentTo.push(w.env.ANTHROPIC_BASE_URL)
-    if (w.hold) await w.hold
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+    const toolUses = (e.agentId ? undefined : w.responses.shift()) ?? []
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses, stopReason: toolUses.length ? ('tool_use' as const) : ('end_turn' as const), usage: null }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   return w
@@ -144,6 +115,10 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
 
 async function start($: Engine, cwd = '/Users/me/repo/demo-app') {
   await $.session.start({ cwd, surface: 'terminal', isInteractive: true })
+}
+
+async function submit($: Engine, text: string) {
+  return $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } })
 }
 
 async function step($: Engine, turnId: string, index: number, agentId?: string) {
@@ -155,18 +130,19 @@ async function step($: Engine, turnId: string, index: number, agentId?: string) 
 
 const USAGE = { input_tokens: 10, output_tokens: 300, cache_read_input_tokens: 900, cache_creation_input_tokens: 0, model: 'claude-opus-5-5' }
 
-async function complete($: Engine, w: World, clock: MockClock, turnId: string) {
+async function complete($: Engine, w: World, turnId: string) {
   const before = logged(w).length
   await $.turn.complete({ answer: 'Found it.', durationMs: 4_000, isAborted: false, turnId, reason: 'answer', usage: USAGE })
-  await clock.advance(300) // the last look at the gateway, a moment after the turn
   await settle(() => logged(w).length > before)
 }
 
-/** One whole turn: its start, `requests` model requests, its end, and its log line. */
-async function turn($: Engine, w: World, clock: MockClock, text: string, requests: number, turnId = 'turn-1') {
+/** A whole turn with no tools: the prompt, one model request, the end. */
+async function plainTurn($: Engine, w: World, text: string, turnId = 'turn-1') {
+  const sent = await submit($, text)
   await $.turn.start({ text, turnId })
-  for (let index = 0; index < requests; index++) await step($, turnId, index)
-  await complete($, w, clock, turnId)
+  await step($, turnId, 0)
+  await complete($, w, turnId)
+  return sent
 }
 
 async function settle(until: () => boolean) {
@@ -178,106 +154,192 @@ function logged(w: World) {
   return text.trim().split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(r => r.type === 'turn')
 }
 
-/** A command the person typed. */
 async function command($: Engine, name: string) {
   return $.command.run({ command: name, args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
 }
 
-const launches = (w: World) => w.runs.filter(r => r.argv[1] === `${PACKAGE}/bin/jev-claude.mjs`).map(r => r.argv[2])
+/** Every turn gets hints: no control turns drawn at random. */
+const HINTS = { options: { controlPercent: 0 } }
 
 const PANE_PROPS = { title: 'Jev', isFocused: false, bodyColumns: 90, placement: 'dock' as const, scroll: { offset: 0, bodyRows: 40 }, view: {} }
 const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 100, scroll: { offset: 0, bodyRows: 6 }, view: {} }
 
 async function band($: Engine, surface: 'terminal' | 'desktop' = 'terminal') {
-  return $.ui.mount({ plugin: 'jev', surface, component: 'AbovePrompt', props: BAND_PROPS })
+  return $.ui.mount({ plugin: 'jev', surface, component: 'AbovePrompt', requestId: 'band', props: BAND_PROPS })
 }
 
-test('starts the gateway at session start and routes the session through it from the first request', async ($, on) => {
+/** The band's two lines: what is happening, and the setting under it. */
+async function lines($: Engine) {
+  const b = await band($)
+  const texts = (await b.findAll({ type: 'Text' })).map(t => t.text)
+  await b.unmount()
+  return texts
+}
+
+test('asks Jev before the first request and after the tools; each hint rides the prompt or the last tool result', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
+  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 
-  expect(launches(w)).toEqual(['--start'])
-  expect(w.runs.find(r => r.argv[2] === '--start')!.env).toEqual({ JEV_CLAUDE_PORT: '8794', JEV_CLAUDE_UPSTREAM_BASE_URL: 'https://api.anthropic.com/v1' })
-  const idle = await band($)
-  expect(await idle.find({ type: 'Raster' })).toBeDefined()
-  expect(await idle.find({ text: /Jev idle · routing on/ })).toBeDefined()
-  await idle.unmount()
+  const sent = await submit($, 'why does the test fail?')
+  expect(sent).toMatchObject({ context: [hintText('Read')] })
+  expect(w.asks).toHaveLength(1)
+  expect(w.asks[0]!.auth).toBe(`Bearer ${KEY}`)
+  expect(w.asks[0]!.state.conversation.at(-1)).toEqual({ role: 'user', text: 'why does the test fail?' })
+  // the answer runs back to Claude, said under the status line's setting
+  expect(await lines($)).toEqual(['Jev hinted Read 0.90', 'routing on'])
 
-  await turn($, w, clock, 'why does the test fail?', 2)
-  expect(w.sentTo).toEqual([GATEWAY, GATEWAY])
+  await $.turn.start({ text: 'why does the test fail?', turnId: 'turn-1' })
+  w.responses.push([{ name: 'Read', input: { file_path: 'x.ts' } }])
+  await step($, 'turn-1', 0)
+  // a subagent's request is not the main loop's: not counted, Jev not asked
+  await step($, 'agent-turn', 0, 'agent-1')
+  w.messages = () => [
+    { role: 'user', text: 'why does the test fail?', toolUses: [] },
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: w.toolUseIds[0]!, tool: 'Read', input: { file_path: 'x.ts' } }] },
+  ]
+  w.jev.push(answer('Bash', 0.85))
+  const read = await $.tool.call({ tool: 'Read', file_path: 'x.ts' })
+  expect(read).toMatchObject({ context: [hintText('Bash')] })
+  // Jev read the result Claude is about to read, before the conversation stored it
+  expect(w.asks[1]!.state.conversation).toContainEqual({ role: 'tool_result', tool: 'Read', content: 'Read result' })
+
+  await step($, 'turn-1', 1)
+  await complete($, w, 'turn-1')
   const [record] = logged(w)
-  expect(record.route).toBe('gateway')
-  expect(record.prompt).toBe('why does the test fail?')
+  expect(record).toMatchObject({
+    v: 4,
+    arm: 'hint',
+    prompt: 'why does the test fail?',
+    actual: { steps: 2, tools: 1, usage: { output: 300 } },
+    // Claude called Read after the first hint, not Bash after the second
+    jev: { asked: 2, hinted: 2, followed: 1, cards: ['pick', 'pick'] },
+  })
+  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 
   const out = await command($, 'jev-report')
-  expect(out.text).toContain('Jev report, last 7 days: 1 turns · 1 through the gateway.')
+  expect(out.text).toContain('1 turns · 1 with hints · 0 control · 0 shadow.')
 })
 
-test('a gateway that stops answering: requests go direct before they leave, and the next turn restarts it', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: 'https://llm-proxy.example.com' } })
-  await start($)
-  expect(w.gateway.upstream).toBe('https://llm-proxy.example.com/v1')
-  await turn($, w, clock, 'one', 1, 'turn-1')
-
-  w.gateway.up = false
-  w.gateway.startable = false
-  await clock.advance(1_001)
-  await turn($, w, clock, 'two', 2, 'turn-2')
-  // straight back to the address the session started with, not a failed request
-  expect(w.sentTo).toEqual([GATEWAY, 'https://llm-proxy.example.com', 'https://llm-proxy.example.com'])
-  expect(w.toasts.filter(t => /stopped answering/.test(t))).toHaveLength(1)
-  expect(logged(w)[1]).toMatchObject({ route: 'down', fallbacks: 2 })
-  const down = await band($)
-  expect(await down.find({ text: /gateway down · direct/ })).toBeDefined()
-  await down.unmount()
-
-  // the next turn tries a restart; while it fails, requests keep going direct, with no new alarm
-  await clock.advance(1_001)
-  await turn($, w, clock, 'three', 1, 'turn-3')
-  expect(launches(w)).toEqual(['--start', '--start'])
-  expect(w.sentTo.at(-1)).toBe('https://llm-proxy.example.com')
-  expect(w.toasts.filter(t => /stopped answering/.test(t))).toHaveLength(1)
-
-  // once a restart works, requests go through the gateway again
-  w.gateway.startable = true
-  await clock.advance(1_001)
-  await $.turn.start({ text: 'four', turnId: 'turn-4' })
-  await settle(() => w.gateway.up)
-  await clock.settle()
-  await step($, 'turn-4', 0)
-  expect(launches(w)).toEqual(['--start', '--start', '--start'])
-  expect(w.sentTo.at(-1)).toBe(GATEWAY)
-  await complete($, w, clock, 'turn-4')
-  expect(logged(w)[3].route).toBe('gateway')
-})
-
-test('the watchdog lets go of a gateway that dies between turns', async ($, on) => {
+test('one ask per response: with calls in parallel, only the last to finish asks and carries the hint', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
-  await turn($, w, clock, 'one', 1)
-  expect(w.env.ANTHROPIC_BASE_URL).toBe(GATEWAY)
-  w.gateway.up = false
-  await clock.advance(5_000)
-  await settle(() => w.env.ANTHROPIC_BASE_URL === undefined)
-  expect(w.env.ANTHROPIC_BASE_URL).toBeUndefined()
-})
-
-test('subagent requests are guarded too, and counted in the turn of the main loop', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  await $.turn.start({ text: 'explore the repo', turnId: 'turn-1' })
+  w.messages = () => [{ role: 'user', text: 'look around', toolUses: [] }]
+  await submit($, 'look around')
+  await $.turn.start({ text: 'look around', turnId: 'turn-1' })
+  w.responses.push([
+    { name: 'Read', input: { file_path: 'a.ts' } },
+    { name: 'Bash', input: { command: 'ls' } },
+  ])
   await step($, 'turn-1', 0)
-  w.gateway.up = false
-  await clock.advance(1_001)
-  await step($, 'agent-turn', 0, 'agent-1')
-  expect(w.sentTo).toEqual([GATEWAY, undefined])
+  const results = await Promise.all([$.tool.call({ tool: 'Read', file_path: 'a.ts' }), $.tool.call({ tool: 'Bash', command: 'ls' })])
+  expect(w.asks).toHaveLength(2)
+  expect(results.filter(r => 'context' in r && r.context)).toHaveLength(1)
 })
 
-test('an excluded repo never goes through the gateway, and its words stay out of the log', { options: { excludedRepos: 'demo-app' } }, async ($, on) => {
+test('the band follows the turn: Jev deciding, its card landing, then Claude thinking and working', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  let release = () => {}
+  w.jev.push({ ...answer('Read'), hold: new Promise<void>(r => (release = r)) })
+  const sent = submit($, 'what changed?')
+  await settle(() => w.asks.length === 1)
+  expect(await lines($)).toEqual(['Jev deciding…', 'routing on'])
+  release()
+  await sent
+  expect(await lines($)).toEqual(['Jev hinted Read 0.90', 'routing on'])
+
+  await $.turn.start({ text: 'what changed?', turnId: 'turn-1' })
+  w.messages = () => [{ role: 'user', text: 'what changed?', toolUses: [] }]
+  w.responses.push([{ name: 'Read', input: { file_path: 'x.ts' } }])
+  await step($, 'turn-1', 0)
+  // once the card has crossed, Claude's request shows
+  await clock.advance(7 * 180)
+  expect(await lines($)).toEqual(['Claude thinking…', 'routing on'])
+
+  let done = () => {}
+  w.toolHold = new Promise<void>(r => (done = r))
+  const call = $.tool.call({ tool: 'Read', file_path: 'x.ts' })
+  await settle(() => w.toolUseIds.length === 1)
+  expect(await lines($)).toEqual(['Claude working · Read', 'routing on'])
+  done()
+  await call
+  expect(w.asks).toHaveLength(2)
+})
+
+test('Jev too slow: the prompt goes on without a hint after the time budget, and the card says so', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  let release = () => {}
+  w.jev.push({ ...answer('Read'), hold: new Promise<void>(r => (release = r)) })
+  const sent = submit($, 'is it in prod?')
+  await settle(() => w.asks.length === 1)
+  await clock.advance(4_000)
+  const result = await sent
+  expect('context' in result ? result.context : undefined).toBeUndefined()
+  expect(await lines($)).toEqual(['Jev left it to Claude · Jev too slow', 'routing on'])
+  release()
+})
+
+test('Jev failing: the request goes on without a hint, counted as a failure', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push({ status: 503 }, { status: 503 })
+  const sent = submit($, 'hello')
+  await settle(() => w.asks.length === 1)
+  // one retry after a short pause, then it gives up
+  await clock.advance(100)
+  const result = await sent
+  expect('context' in result ? result.context : undefined).toBeUndefined()
+  expect(w.asks).toHaveLength(2)
+  await $.turn.start({ text: 'hello', turnId: 'turn-1' })
+  await step($, 'turn-1', 0)
+  await complete($, w, 'turn-1')
+  expect(logged(w)[0]).toMatchObject({ arm: 'hint', jev: { asked: 1, hinted: 0, reasons: { jev_error: 1 }, cards: ['fail'] } })
+})
+
+test('a control turn: Jev sits it out, the owl sleeps, and the band says why', { options: { controlPercent: 100 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  await submit($, 'hello')
+  await $.turn.start({ text: 'hello', turnId: 'turn-1' })
+  w.responses.push([{ name: 'Bash', input: { command: 'ls' } }])
+  await step($, 'turn-1', 0)
+  expect(await lines($)).toEqual(['Claude thinking…', 'routing on · control turn, no hints'])
+  const bash = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect('context' in bash ? bash.context : undefined).toBeUndefined()
+  await step($, 'turn-1', 1)
+  await complete($, w, 'turn-1')
+  expect(w.asks).toHaveLength(0)
+  expect(logged(w)[0]).toMatchObject({ arm: 'control' })
+  expect(logged(w)[0].jev).toBeUndefined()
+})
+
+test('shadow: Jev is asked and recorded, Claude gets nothing, and Claude choosing the same tool counts', { options: { mode: 'shadow' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  const sent = await submit($, 'run the tests')
+  expect('context' in sent ? sent.context : undefined).toBeUndefined()
+  expect(await lines($)).toEqual(['Jev would hint Read 0.90 (shadow)', 'routing in shadow · Claude sees no hints'])
+  await $.turn.start({ text: 'run the tests', turnId: 'turn-1' })
+  w.responses.push([{ name: 'Read', input: { file_path: 'package.json' } }])
+  await step($, 'turn-1', 0)
+  w.messages = () => [{ role: 'user', text: 'run the tests', toolUses: [] }]
+  const read = await $.tool.call({ tool: 'Read', file_path: 'package.json' })
+  expect('context' in read ? read.context : undefined).toBeUndefined()
+  await step($, 'turn-1', 1)
+  await complete($, w, 'turn-1')
+  expect(logged(w)[0]).toMatchObject({ arm: 'shadow', jev: { asked: 2, hinted: 2, followed: 1 } })
+})
+
+test('an excluded repo: Jev is never asked, the band stays out of the way, and its words stay out of the log', { options: { excludedRepos: 'demo-app' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
@@ -285,270 +347,97 @@ test('an excluded repo never goes through the gateway, and its words stay out of
     return h(Text as never, null, 'the engine band') as never
   })
   await start($)
-  expect(launches(w)).toEqual([])
-  await turn($, w, clock, 'the client secret plan', 1)
-  expect(w.sentTo).toEqual([undefined])
-  expect(logged(w)[0]).toMatchObject({ route: 'excluded', prompt: '' })
+  await plainTurn($, w, 'the client secret plan')
+  expect(w.asks).toHaveLength(0)
+  expect(logged(w)[0]).toMatchObject({ arm: 'excluded', prompt: '' })
   const quiet = await band($)
   expect(await quiet.find({ text: /Jev/ })).toBeUndefined()
   expect(await quiet.find({ text: /the engine band/ })).toBeDefined()
   await quiet.unmount()
 })
 
-test('a session started through jev-claude in an excluded repo goes direct', { options: { excludedRepos: 'demo-app' } }, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: JEV_CLAUDE }, gatewayAt: JEV_CLAUDE, up: true })
-  await start($)
-  await turn($, w, clock, 'hello', 1)
-  expect(w.sentTo).toEqual([undefined])
-})
-
-test('off in /config: nothing starts and the session goes as it started', { options: { gateway: 'off' } }, async ($, on) => {
+test('off in /config: nothing is asked and nothing logged', { options: { mode: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
-  expect(launches(w)).toEqual([])
+  await submit($, 'hello')
   await $.turn.start({ text: 'hello', turnId: 'turn-1' })
   await step($, 'turn-1', 0)
   await $.turn.complete({ answer: 'Hi.', durationMs: 1_000, isAborted: false, turnId: 'turn-1', reason: 'answer' })
-  await clock.advance(300)
-  expect(w.sentTo).toEqual([undefined])
+  expect(w.asks).toHaveLength(0)
   expect(logged(w)).toEqual([])
 })
 
-test('a session started through jev-claude: the mod watches that gateway and runs none', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: JEV_CLAUDE }, gatewayAt: JEV_CLAUDE, up: true })
-  await start($)
-  await turn($, w, clock, 'one', 1, 'turn-1')
-  w.gateway.up = false
-  await clock.advance(1_001)
-  await turn($, w, clock, 'two', 1, 'turn-2')
-  expect(w.sentTo).toEqual([JEV_CLAUDE, undefined])
-  expect(launches(w)).toEqual([])
-
-  w.gateway.up = true
-  await clock.advance(1_001)
-  await turn($, w, clock, 'three', 1, 'turn-3')
-  expect(w.sentTo.at(-1)).toBe(JEV_CLAUDE)
-  expect(launches(w)).toEqual([])
-})
-
-test('not set up: the band says what to do and nothing is routed', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { installed: false })
-  await start($)
-  expect(launches(w)).toEqual([])
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const b = await band($, surface)
-    expect(await b.find({ text: /Jev not set up · run \/jev-setup to install it/ })).toBeDefined()
-    await b.unmount()
-  }
-  await turn($, w, clock, 'hello', 1)
-  expect(w.sentTo).toEqual([undefined])
-})
-
-test('no key: the band asks for one', async ($, on) => {
+test('no key: the band says what to do, on every surface, and nothing is asked', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock, { key: false })
   await start($)
-  expect(launches(w)).toEqual([])
-  const b = await band($)
-  expect(await b.find({ text: /add a key for Jev/ })).toBeDefined()
-  await b.unmount()
+  expect(await lines($)).toEqual(['Jev not set up · run /jev-setup', 'routing off · no key'])
+  const desktop = await band($, 'desktop')
+  expect(await desktop.find({ text: /Jev not set up/ })).toBeDefined()
+  await desktop.unmount()
+  await submit($, 'hello')
+  expect(w.asks).toHaveLength(0)
 })
 
-test('/jev-setup installs the pinned gateway after asking, saves the key without it ever reaching argv, and starts routing', async ($, on) => {
+test('/jev-setup checks the key with one call, saves it without it reaching argv or the output, and Jev is ready', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { installed: false, key: false })
+  const w = world(on, clock, { key: false })
   await start($)
-  w.answers.push('Install', 'OpenRouter', 'Read the clipboard')
+  w.answers.push('OpenRouter', 'Read the clipboard')
   const out = await command($, 'jev-setup')
-
-  expect(out.text).toContain('Installed jev-gateway 0.5.0')
-  expect(out.text).toContain('Key checked (Jev answered in 280ms)')
-  expect(out.text).toContain(`jev-gateway is running on ${GATEWAY}`)
-  const npm = w.runs.find(r => r.argv[0] === 'npm')!
-  expect(npm.argv).toContain('jev-gateway@0.5.0')
-  expect(npm.argv).toContain(`${HOME}/.claude/jev-mod/gateway/0.5.0`)
-  const save = w.runs.find(r => r.argv[1]?.endsWith('/scripts/save-key.mjs'))!
-  expect(JSON.parse(save.stdin!)).toMatchObject({ provider: 'openrouter', key: KEY, root: PACKAGE })
-  expect(w.runs.some(r => r.argv.join(' ').includes(KEY))).toBe(false)
+  expect(out.text).toContain('Key checked')
+  expect(out.text).toContain('Jev is ready (OpenRouter)')
   expect(out.text).not.toContain(KEY)
-  expect(w.runs.some(r => r.argv[0] === 'pbcopy')).toBe(true)
-
-  await turn($, w, clock, 'hello', 1)
-  expect(w.sentTo).toEqual([GATEWAY])
+  expect(w.files[KEY_FILE]).toBe(`JEV_PROVIDER=openrouter\nOPENROUTER_API_KEY=${KEY}\n`)
+  expect(w.runs.some(argv => argv.join(' ').includes(KEY))).toBe(false)
+  expect(w.runs).toContainEqual(['chmod', '600', KEY_FILE])
+  expect(w.runs.some(argv => argv[0] === 'pbcopy')).toBe(true)
+  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 })
 
-test('/jev-setup stops at a cancelled install and changes nothing', async ($, on) => {
+test('/jev-setup with a refused key saves nothing', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock, { installed: false, key: false })
+  const w = world(on, clock, { key: false })
   await start($)
-  w.answers.push('Cancel')
+  w.answers.push('OpenRouter', 'Read the clipboard')
+  w.jev.push({ status: 401, body: { error: 'bad key' } })
   const out = await command($, 'jev-setup')
-  expect(out.text).toContain('nothing was installed')
-  expect(w.runs.some(r => r.argv[0] === 'npm')).toBe(false)
+  expect(out.text).toContain('OpenRouter refused that key')
+  expect(w.files[KEY_FILE]).toBeUndefined()
 })
 
-test('the band and the log show what Jev decided; the pane switches Jev routing and pauses this session', async ($, on) => {
+test('a session v0.4 left pointing at its gateway goes straight to the API again', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
+  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8794' } })
   await start($)
-
-  await $.turn.start({ text: 'why does the test fail?', turnId: 'turn-1' })
-  w.gateway.events.push({ seq: 1, mode: 'hint', tool: 'Bash', confidence: 0.82, usage: { input: 10, output: 40, cached: 900, cacheWrite: 0, reasoning: 0 }, jev: { choice: 'Bash', confidence: 0.82, latencyMs: 240 } })
-  await step($, 'turn-1', 0)
-  await clock.settle()
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const b = await band($, surface)
-    expect(await b.find({ text: /Jev picked Bash 0\.82 \(hint\)/ })).toBeDefined()
-    await b.unmount()
-  }
-
-  w.gateway.events.push({ seq: 2, mode: 'passthrough', reason: 'low_confidence', usage: { input: 10, output: 60, cached: 900, cacheWrite: 0, reasoning: 0 } })
-  await step($, 'turn-1', 1)
-  await clock.settle()
-  const passed = await band($)
-  expect(await passed.find({ text: /Jev left it to Claude · Jev was unsure/ })).toBeDefined()
-  await passed.unmount()
-
-  await complete($, w, clock, 'turn-1')
-  const [record] = logged(w)
-  expect(record.gateway.requests).toBe(2)
-  expect(record.gateway.modes).toEqual({ hint: 1, passthrough: 1 })
-  expect(record.gateway.picks[0].tool).toBe('Bash')
-  const after = await band($)
-  expect(await after.find({ text: /Jev idle/ })).toBeDefined()
-  await after.unmount()
-
-  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /● running/ })).toBeDefined()
-  expect(await pane.find({ text: /Jev steered/ })).toBeDefined()
-  expect(await pane.find({ text: /Bash/ })).toBeDefined()
-  await pane.press({ key: 'routing' })
-  expect(w.routingPosts).toEqual([`${GATEWAY}/dashboard/routing?enabled=false`])
-  await pane.press({ key: 'route' })
   expect(w.env.ANTHROPIC_BASE_URL).toBeUndefined()
-  await pane.unmount()
-
-  await turn($, w, clock, 'paused now', 1, 'turn-2')
-  expect(w.sentTo.at(-1)).toBeUndefined()
 })
 
-test('while a request is in flight the band follows it: Jev decides, Claude thinks, then the card lands', async ($, on) => {
+test('a local proxy the session started with is kept, and the pane notes it', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
+  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8789' } })
   await start($)
-  let release = () => {}
-  w.hold = new Promise<void>(resolve => {
-    release = resolve
-  })
-
-  // The band stays mounted, as in a session: its line must follow the scene as the clock moves it on.
-  const b = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props: BAND_PROPS })
-  await $.turn.start({ text: 'why does the test fail?', turnId: 'turn-1' })
-  const inFlight = step($, 'turn-1', 0)
-  await clock.settle()
-  expect(await b.find({ text: /Jev deciding/ })).toBeDefined()
-  // a long reply: the band keeps moving the whole time instead of going blank
-  for (let i = 0; i < 9; i++) await clock.advance(180)
-  expect(await b.find({ text: /Claude thinking/ })).toBeDefined()
-  await clock.advance(180 * 20)
-  expect(await b.find({ text: /Claude thinking/ })).toBeDefined()
-
-  w.gateway.events.push({ seq: 1, mode: 'hint', tool: 'Read', confidence: 0.99 })
-  release()
-  await inFlight
-  await clock.settle()
-  expect(await b.find({ text: /Jev picked Read 0\.99 \(hint\)/ })).toBeDefined()
-  await b.unmount()
-})
-
-test('with Jev routing off the band says requests pass straight through', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  w.gateway.routing = false
-  await start($)
-  const idle = await band($)
-  expect(await idle.find({ text: /Jev idle · routing off \(baseline\)/ })).toBeDefined()
-  await idle.unmount()
-
-  let release = () => {}
-  w.hold = new Promise<void>(resolve => {
-    release = resolve
-  })
-  await $.turn.start({ text: 'hello', turnId: 'turn-1' })
-  const inFlight = step($, 'turn-1', 0)
-  await clock.settle()
-  const passing = await band($)
-  expect(await passing.find({ text: /passing it through/ })).toBeDefined()
-  await passing.unmount()
-  release()
-  await inFlight
-})
-
-test('a reload mid-turn does not leave the band stuck', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  world(on, clock)
-  await start($)
-  await $.turn.start({ text: 'build it', turnId: 'turn-1' })
-  await step($, 'turn-1', 0)
-  await start($) // what a hot reload fires: the turn in flight is gone with the old module
-  const b = await band($)
-  expect(await b.find({ text: /Jev deciding/ })).toBeUndefined()
-  expect(await b.find({ text: /Jev idle/ })).toBeDefined()
-  await b.unmount()
-})
-
-test('the scene moves while a turn runs and holds still after it', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const frames: string[] = []
-  const w = world(on, clock, { frames })
-  await start($)
-  await $.turn.start({ text: 'redesign the router', turnId: 'turn-1' })
-  await step($, 'turn-1', 0)
-
-  const b = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'AbovePrompt', requestId: 'band', props: BAND_PROPS })
-  for (let i = 0; i < 4; i++) await clock.advance(180)
-  expect(frames.length).toBeGreaterThan(2)
-  expect(new Set(frames).size).toBeGreaterThan(1)
-
-  await complete($, w, clock, 'turn-1')
-  const count = frames.length
-  await clock.advance(720)
-  expect(frames.length).toBe(count)
-  await b.unmount()
-})
-
-test('a reinstall in a session the mod already routed runs its own gateway, not watch-only', async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  // An earlier install left the session pointed at the mod's own gateway; the new one starts fresh.
-  const w = world(on, clock, { env: { ANTHROPIC_BASE_URL: GATEWAY }, up: true })
-  await start($)
+  expect(w.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8789')
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /jev-claude/ })).toBeUndefined()
-  expect(await pane.find({ key: 'restart' })).toBeDefined()
+  expect(await pane.find({ text: /local proxy \(http:\/\/127\.0\.0\.1:8789\)/ })).toBeDefined()
   await pane.unmount()
-  // and direct means the API again, never the gateway it was left pointing at
-  w.gateway.up = false
-  await clock.advance(1_001)
-  await turn($, w, clock, 'hello', 1)
-  expect(w.sentTo).toEqual([undefined])
 })
 
-test('the pane shows the last turn and the switches on terminal and desktop', async ($, on) => {
+test("the pane shows the last turn's answers, and pausing stops Jev for this session", HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
-  await turn($, w, clock, 'is it in prod?', 1)
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const pane = await $.ui.mount({ plugin: 'jev', surface, component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-    expect(await pane.find({ text: /is it in prod\?/ })).toBeDefined()
-    expect(await pane.find({ text: /through the gateway/ })).toBeDefined()
-    expect(await pane.find({ text: /switch Jev routing off/ })).toBeDefined()
-    for (const key of ['route', 'routing', 'restart', 'report']) expect(await pane.find({ key })).toBeDefined()
-    expect(await pane.find({ key: 'setup' })).toBeUndefined()
-    await pane.unmount()
-  }
+  await plainTurn($, w, 'why does the test fail?')
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /ready/ })).toBeDefined()
+  expect(await pane.find({ text: /Jev hinted/ })).toBeDefined()
+  expect(await pane.find({ text: /^Read$/ })).toBeDefined()
+  await pane.press({ key: 'pause' })
+  await pane.unmount()
+
+  expect(await lines($)).toEqual(['Jev paused', 'routing paused for this session'])
+  await plainTurn($, w, 'and now?', 'turn-2')
+  expect(w.asks).toHaveLength(1)
+  expect(logged(w)[1]).toMatchObject({ arm: 'off' })
 })

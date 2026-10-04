@@ -1,30 +1,28 @@
-// Pure parts of the mod: how jev-gateway's decisions are read and added up, and the report.
-// Nothing here touches `$`, so tests run it as is.
+// Pure parts of the mod: what Jev is asked, how its answer becomes a hint, the key file, the log
+// and the report. Nothing here touches `$`, so tests run it as is.
 //
-// The mod runs jev-gateway (github.com/vinilana/jev-gateway) for Claude Code: it starts the
-// gateway, points this session's model requests at it by setting ANTHROPIC_BASE_URL, which
-// Claude Code reads on every request, and goes back to direct the moment the gateway stops
-// answering. On each request the gateway asks Jev which tool fits and steers Claude when Jev
-// is confident; the mod shows that live and measures it against routing switched off.
+// Before each of Claude's requests the mod asks Jev, TypeSafe's fast decision model, which tool
+// fits next. When Jev is confident and its two answers agree, the mod adds one line for Claude:
+// a hint, which Claude is free to ignore. The questions, the rule and the hint's wording are
+// ported from jev-gateway (github.com/vinilana/jev-gateway, MIT), whose Claude Code path only
+// ever hints: with thinking on, the API refuses a forced tool.
 
-/** The jev-gateway release the mod installs: a known version, upgraded on purpose. */
-export const GATEWAY_VERSION = '0.5.0'
-export const DEFAULT_PORT = 8794
-export const ANTHROPIC_UPSTREAM = 'https://api.anthropic.com/v1'
-/** The Node.js the gateway needs (its package.json `engines`). */
-export const NODE_MIN: readonly [number, number] = [22, 15]
+// ---------------------------------------------------------------- where Jev runs
 
-/**
- * Where Jev runs, as the gateway's own `providers.json` lists them (labels and key names only:
- * the key check and the key file go through the gateway's own `bin/setup.mjs`).
- */
-export const GATEWAY_PROVIDERS = {
-  openrouter: { label: 'OpenRouter', keyEnv: 'OPENROUTER_API_KEY', keyUrl: 'https://openrouter.ai/settings/keys' },
-  typesafe: { label: 'TypeSafe', keyEnv: 'TYPESAFE_API_KEY', keyUrl: 'https://typesafe.ai' },
-  opencode: { label: 'OpenCode (free model)', keyEnv: 'OPENCODE_API_KEY', keyUrl: 'https://opencode.ai/auth' },
-  vercel: { label: 'Vercel AI Gateway', keyEnv: 'AI_GATEWAY_API_KEY', keyUrl: 'https://vercel.com/dashboard/ai-gateway/api-keys' },
+/** Where Jev can be reached; the table jev-gateway uses (its providers.json). */
+export const PROVIDERS = {
+  typesafe: { label: 'TypeSafe', keyEnv: 'TYPESAFE_API_KEY', keyUrl: 'https://typesafe.ai', url: 'https://api.typesafe.ai/v1/systemone', model: 'jev-latest' },
+  openrouter: { label: 'OpenRouter', keyEnv: 'OPENROUTER_API_KEY', keyUrl: 'https://openrouter.ai/settings/keys', url: 'https://openrouter.ai/api/alpha/decisions', model: 'typesafe/jev-1.13' },
+  vercel: { label: 'Vercel AI Gateway', keyEnv: 'AI_GATEWAY_API_KEY', keyUrl: 'https://vercel.com/dashboard/ai-gateway/api-keys', url: 'https://ai-gateway.vercel.sh/typesafe/v1/systemone', model: 'typesafe-ai/jev' },
+  opencode: { label: 'OpenCode (free model)', keyEnv: 'OPENCODE_API_KEY', keyUrl: 'https://opencode.ai/auth', url: 'https://opencode.ai/zen/v1/systemone', model: 'jev-1.13-free', paidModel: 'jev-1.13' },
 } as const
-export type GatewayProvider = keyof typeof GATEWAY_PROVIDERS
+export type Provider = keyof typeof PROVIDERS
+const PROVIDER_IDS = Object.keys(PROVIDERS) as Provider[]
+
+/** How long one Jev call may take before the request goes on without a hint. */
+export const JEV_TIMEOUT_MS = 4000
+/** Jev must be at least this sure before Claude gets a hint (jev-gateway's default). */
+export const MIN_CONFIDENCE = 0.7
 
 /** The variables of a `.env` file (`NAME=value`, `export` and quotes allowed). */
 export function parseEnvFile(text: string): Record<string, string> {
@@ -37,156 +35,335 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out
 }
 
+/** Sets `values` in a `.env` file's text, replacing lines that exist and keeping everything else. */
+export function upsertEnv(text: string, values: Record<string, string>): string {
+  const lines = text === '' ? [] : text.replace(/\n$/, '').split('\n')
+  for (const [name, value] of Object.entries(values)) {
+    const line = `${name}=${value}`
+    const at = lines.findIndex(existing => new RegExp(`^\\s*(export\\s+)?${name}\\s*=`).test(existing))
+    if (at >= 0) lines[at] = line
+    else lines.push(line)
+  }
+  return lines.join('\n') + '\n'
+}
+
+/** The key, endpoint and model the mod calls Jev with. */
+export type JevAccess = { provider: Provider; key: string; url: string; model: string }
+
 /**
- * Which provider the gateway will use, by its own rule: an explicit JEV_PROVIDER, else whichever
- * key is there. The process environment wins over the key file, as the gateway's launcher has it.
+ * Which provider and key to use, by jev-gateway's rule: an explicit JEV_PROVIDER, else whichever
+ * key is there. The process environment wins over the key file.
  */
-export function keyProvider(file: Record<string, string>, env: Record<string, string | undefined>): GatewayProvider | undefined {
+export function jevAccess(file: Record<string, string>, env: Record<string, string | undefined>): JevAccess | undefined {
   const merged: Record<string, string | undefined> = { ...file }
   for (const [name, value] of Object.entries(env)) if (value?.trim()) merged[name] = value
-  const present = (id: GatewayProvider) => Boolean(merged[GATEWAY_PROVIDERS[id].keyEnv]?.trim())
-  const ids = Object.keys(GATEWAY_PROVIDERS) as GatewayProvider[]
+  const keyOf = (id: Provider) => merged[PROVIDERS[id].keyEnv]?.trim()
   const chosen = merged.JEV_PROVIDER?.trim().toLowerCase()
-  const id = ids.find(p => p === chosen) ?? ids.find(present)
-  return id && present(id) ? id : undefined
+  const provider = PROVIDER_IDS.find(p => p === chosen) ?? PROVIDER_IDS.find(p => keyOf(p))
+  const key = provider && keyOf(provider)
+  if (!provider || !key) return undefined
+  const p = PROVIDERS[provider]
+  const requested = merged.JEV_MODEL?.trim()
+  // A model id belongs to one provider's namespace: TypeSafe's have no slash, the resellers' do.
+  const fits = requested
+    ? provider === 'opencode'
+      ? requested === PROVIDERS.opencode.model || requested === PROVIDERS.opencode.paidModel
+      : requested.includes('/') === (provider !== 'typesafe')
+    : false
+  const base = provider === 'typesafe' ? merged.TYPESAFE_BASE_URL?.trim() : undefined
+  const url = merged.JEV_URL?.trim() || (base ? `${base.replace(/\/+$/, '')}/v1/systemone` : p.url)
+  return { provider, key, url, model: fits ? requested! : p.model }
 }
 
-/** Where the gateway forwards: the API the session used before it was routed, plus `/v1`. */
-export function upstreamFor(original: string | null | undefined): string {
-  const base = original?.trim().replace(/\/+$/, '')
-  if (!base) return ANTHROPIC_UPSTREAM
-  return base.endsWith('/v1') ? base : `${base}/v1`
+export function isValidKey(key: string): boolean {
+  return /^[A-Za-z0-9._\-]{20,300}$/.test(key)
 }
 
-/** Whether `node --version` printed a Node.js the gateway runs on. */
-export function nodeVersionOk(text: string): boolean {
-  const m = /v?(\d+)\.(\d+)/.exec(text.trim())
-  if (!m) return false
-  const major = Number(m[1])
-  const minor = Number(m[2])
-  return major > NODE_MIN[0] || (major === NODE_MIN[0] && minor >= NODE_MIN[1])
+// ---------------------------------------------------------------- what Jev reads
+
+/** One turn as Jev reads it: prose, a tool call, or a tool's result. */
+export type StateTurn =
+  | { role: 'user' | 'assistant'; text: string }
+  | { role: 'assistant'; tool_calls: { tool: string; arguments: string }[] }
+  | { role: 'tool_result'; tool: string; content: string }
+
+export type JevState = { assistant_instructions?: string; earlier_turns_omitted?: number; conversation: StateTurn[] }
+
+/** The parts of a conversation row the state is built from (`$.session.messages()` rows). */
+export type MessageRow = {
+  role: 'user' | 'assistant'
+  text: string
+  toolUses: readonly { tool_use_id: string; tool: string; input: unknown; text?: string }[]
 }
 
-// ---------------------------------------------------------------- the gateway's decisions
+export const MAX_STATE_CHARS = 60_000
+export const MAX_MESSAGE_CHARS = 4_000
 
-/** One routed request, as jev-gateway's /dashboard/events reports it (the fields the mod reads). */
-export type GatewayEvent = {
-  seq: number
-  mode: string
-  reason?: string
-  tool?: string
-  confidence?: number
-  status?: number
-  durationMs?: number
-  usage?: { input: number; output: number; cached: number; cacheWrite: number; reasoning: number }
-  jev?: { choice: string; confidence: number; latencyMs: number }
+/** Keeps the head and tail of long text; the middle matters least for picking a tool. */
+export function truncate(text: string, max: number): string {
+  if (text.length <= max) return text
+  const marker = ' …[truncated]… '
+  const keep = Math.max(0, max - marker.length)
+  const head = Math.ceil(keep * 0.6)
+  return text.slice(0, head) + marker + text.slice(text.length - (keep - head))
 }
 
-/** Modes where Jev chose the tool: steered by a hint, forced, or answered without the LLM. */
-export const PICK_MODES: ReadonlySet<string> = new Set(['hint', 'forced', 'direct'])
+/**
+ * The conversation as Jev reads it: prose, then each tool call and its result, in order. `results`
+ * holds results the conversation has not stored yet (the call whose hook is asking).
+ */
+export function turnsFrom(rows: readonly MessageRow[], results: Readonly<Record<string, string>> = {}): StateTurn[] {
+  const clip = (text: string) => truncate(text, MAX_MESSAGE_CHARS)
+  const turns: StateTurn[] = []
+  for (const row of rows) {
+    if (row.text.trim()) turns.push({ role: row.role, text: clip(row.text) })
+    if (row.role !== 'assistant') continue
+    for (const use of row.toolUses) {
+      turns.push({ role: 'assistant', tool_calls: [{ tool: use.tool, arguments: clip(JSON.stringify(use.input ?? {})) }] })
+      const text = use.text ?? results[use.tool_use_id]
+      if (text !== undefined) turns.push({ role: 'tool_result', tool: use.tool, content: clip(text) })
+    }
+  }
+  return turns
+}
 
-/** Why the gateway let the LLM decide, in plain words. */
+/** The newest turns that fit the budget, after the system prompt's head and tail. */
+export function buildState(turns: readonly StateTurn[], system?: string): JevState {
+  const instructions = system ? truncate(system, MAX_MESSAGE_CHARS) : ''
+  let budget = MAX_STATE_CHARS - instructions.length
+  const conversation: StateTurn[] = []
+  for (let i = turns.length - 1; i >= 0; i--) {
+    budget -= JSON.stringify(turns[i]).length
+    if (budget < 0 && conversation.length > 0) break
+    conversation.unshift(turns[i]!)
+  }
+  const omitted = turns.length - conversation.length
+  return { ...(instructions ? { assistant_instructions: instructions } : {}), ...(omitted ? { earlier_turns_omitted: omitted } : {}), conversation }
+}
+
+// ---------------------------------------------------------------- what Jev is asked
+
+export type Tool = { name: string; description: string }
+
+export const NO_TOOL = 'no_tool_needed'
+const NONE_OF_THESE = 'none_of_these'
+export const TOOL_KEY = 'tool'
+export const NEEDS_TOOL_KEY = 'needs_tool'
+/** Most tools one question may offer; a bigger roster is shortlisted first. */
+export const MAX_TOOLS = 120
+const SHORTLIST_PER_SHARD = 3
+const MAX_DESCRIPTION_CHARS = 1024
+const QUESTION_CHAR_BUDGET = 48_000
+/** A tool name goes into text the model reads, so it must stay one inert token. */
+const SAFE_TOOL_NAME = /^[\p{L}\p{N}_.:/-]{1,128}$/u
+
+export type Question = { type: 'choice'; instructions: string; criteria: Record<string, string | null> } | { type: 'noul'; instructions: string }
+export type Answer = { type: 'choice'; choice: string; confidence: number; probabilities: Record<string, number> } | { type: 'noul'; noul: number }
+
+/** Why a request is not Jev's to decide, or undefined when it is. */
+export function skipReason(tools: readonly Tool[], turns: readonly StateTurn[]): string | undefined {
+  if (turns.length === 0) return 'no_messages'
+  if (tools.length === 0) return 'no_tools'
+  if (tools.length > MAX_TOOLS * 255) return 'too_many_tools'
+  if (tools.some(t => !SAFE_TOOL_NAME.test(t.name))) return 'unsafe_tool_name'
+  if (new Set(tools.map(t => t.name)).size !== tools.length) return 'duplicate_tool_names'
+  if (tools.some(t => t.name === NO_TOOL)) return 'reserved_tool_name'
+  return undefined
+}
+
+function toolCriteria(tools: readonly Tool[]): Record<string, string | null> {
+  const limit = Math.min(MAX_DESCRIPTION_CHARS, Math.floor(QUESTION_CHAR_BUDGET / tools.length))
+  return Object.fromEntries(tools.map(t => [t.name, t.description.trim().slice(0, limit) || null]))
+}
+
+/** The two questions: which tool, and whether a tool is needed at all. */
+export function toolQuestions(tools: readonly Tool[]): Record<string, Question> {
+  return {
+    [TOOL_KEY]: {
+      type: 'choice',
+      instructions: "Given the conversation, what should the assistant do next? Pick the single tool whose call best advances the user's latest request.",
+      criteria: {
+        ...toolCriteria(tools),
+        [NO_TOOL]:
+          'No tool call is needed right now: the assistant should reply to the user in plain text (answer directly, ask a clarifying question, or report results that tools already returned).',
+      },
+    },
+    [NEEDS_TOOL_KEY]: {
+      type: 'noul',
+      instructions: 'Does the assistant need to call one of its tools now, rather than reply to the user in plain text?',
+    },
+  }
+}
+
+/** A first pass over a roster too big for one question: every shard ranked in the same call. */
+export function shortlistQuestions(tools: readonly Tool[]): { questions: Record<string, Question>; shards: Tool[][] } {
+  const count = Math.ceil(tools.length / MAX_TOOLS)
+  const size = Math.ceil(tools.length / count)
+  const shards = Array.from({ length: count }, (_, i) => tools.slice(i * size, (i + 1) * size))
+  const questions: Record<string, Question> = {}
+  shards.forEach((shard, i) => {
+    questions[`shard:${i}`] = {
+      type: 'choice',
+      instructions: "Given the conversation, which of these tools would best advance the user's latest request if the assistant called it next?",
+      criteria: { ...toolCriteria(shard), [NONE_OF_THESE]: 'None of the tools in this list fits the next step.' },
+    }
+  })
+  return { questions, shards }
+}
+
+/** The strongest few tools of every shard. */
+export function shortlisted(shards: readonly Tool[][], answers: Readonly<Record<string, Answer>>): Tool[] {
+  return shards.flatMap((shard, i) => {
+    const answer = answers[`shard:${i}`]
+    if (answer?.type !== 'choice') return []
+    const ranked = Object.entries(answer.probabilities)
+      .filter(([name]) => name !== NONE_OF_THESE)
+      .sort(([, a], [, b]) => b - a)
+      .slice(0, SHORTLIST_PER_SHARD)
+      .map(([name]) => name)
+    return shard.filter(t => ranked.includes(t.name))
+  })
+}
+
+/** Jev's answers, checked; a choice without a confidence takes its winning probability. */
+export function normalizeAnswers(raw: unknown): Record<string, Answer> {
+  const out: Record<string, Answer> = {}
+  for (const [name, a] of Object.entries((raw ?? {}) as Record<string, Record<string, unknown> | undefined>)) {
+    if (a?.type === 'noul' && typeof a.noul === 'number') out[name] = { type: 'noul', noul: a.noul }
+    else if (a?.type === 'choice' && typeof a.choice === 'string') {
+      const probabilities = (a.probabilities ?? {}) as Record<string, number>
+      const values = Object.values(probabilities)
+      const confidence = typeof a.confidence === 'number' ? a.confidence : values.length ? Math.max(...values) : 0
+      out[name] = { type: 'choice', choice: a.choice, confidence, probabilities }
+    }
+  }
+  return out
+}
+
+/** What the mod does with Jev's answer: hint a tool, or leave the choice to Claude (and why). */
+export type Decision = { mode: 'hint' | 'pass'; tool?: string; confidence?: number; reason?: string }
+
+/** jev-gateway's rule: confident, and the two answers agree; "no tool" is never hinted. */
+export function decide(tools: readonly Tool[], answers: Readonly<Record<string, Answer>>, minConfidence = MIN_CONFIDENCE): Decision {
+  const picked = answers[TOOL_KEY]
+  const needs = answers[NEEDS_TOOL_KEY]
+  if (picked?.type !== 'choice' || needs?.type !== 'noul') return { mode: 'pass', reason: 'jev_unexpected_answer' }
+  const confidence = picked.confidence
+  if (confidence < minConfidence) return { mode: 'pass', reason: 'low_confidence', confidence }
+  const wantsTool = picked.choice !== NO_TOOL
+  if (wantsTool ? needs.noul < 0.3 : needs.noul > 0.7) return { mode: 'pass', reason: 'jev_answers_disagree', confidence }
+  // A hint can suggest a tool; suggesting silence would only risk ending a turn early.
+  if (!wantsTool) return { mode: 'pass', reason: 'no_tool_needed', confidence }
+  if (!tools.some(t => t.name === picked.choice)) return { mode: 'pass', reason: 'jev_unknown_tool', confidence }
+  return { mode: 'hint', tool: picked.choice, confidence }
+}
+
+/** The line Claude reads: jev-gateway's wording, free to disagree. */
+export function hintText(tool: string): string {
+  return `A tool-routing model suggests the "${tool}" tool is the most relevant next step. Ignore this if it does not fit what the user actually asked for.`
+}
+
+// ---------------------------------------------------------------- saying it
+
+/** Why Jev left the choice to Claude, in plain words. */
 export const REASON_TEXT: Record<string, string> = {
   low_confidence: 'Jev was unsure',
   jev_answers_disagree: "Jev's two checks disagreed",
   no_tool_needed: 'no tool needed',
   no_tools: 'no tools in the request',
-  no_messages: 'empty request',
-  routing_disabled: 'routing off (baseline)',
-  disabled_by_header: 'routing off for this request',
-  tool_choice_already_decided: 'Claude Code already chose',
-  hosted_tool_selected: 'a hosted tool fit',
-  namespaced_tool_selected: 'a namespaced tool fit',
+  no_messages: 'empty conversation',
   jev_unknown_tool: 'Jev named an unknown tool',
   jev_unexpected_answer: 'unexpected Jev answer',
   jev_error: 'Jev failed',
-  router_error: 'gateway error',
-  unreadable_request: 'unreadable request',
+  jev_timeout: 'Jev too slow',
   too_many_tools: 'too many tools',
+  unsafe_tool_name: 'a tool name it cannot use',
+  duplicate_tool_names: 'duplicate tool names',
 }
 
 export function reasonText(reason: string | undefined): string {
-  if (!reason) return 'passed through'
-  const key = reason.split(':')[0]!.replace(/^upstream_rejected_.*/, 'upstream_rejected')
-  return REASON_TEXT[key] ?? (key === 'upstream_rejected' ? 'the API refused the change' : key.replace(/_/g, ' '))
+  if (!reason) return 'passed'
+  const key = reason.split(':')[0]!
+  return REASON_TEXT[key] ?? key.replace(/_/g, ' ')
 }
 
-/** One decision as the band says it: `Jev picked Bash 0.82 (hint)`, or why Jev left it to Claude. */
-export function decisionText(d: { mode: string; tool?: string; confidence?: number; reason?: string }): string {
+/** One decision as the band says it. */
+export function decisionText(d: Decision, shadow = false): string {
   const sure = d.confidence !== undefined ? ` ${d.confidence.toFixed(2)}` : ''
-  if (d.mode === 'direct' && d.tool) return `Jev called ${d.tool}${sure} itself (direct)`
-  if (PICK_MODES.has(d.mode) && d.tool) return `Jev picked ${d.tool}${sure} (${d.mode})`
-  if (d.mode === 'none') return `Jev: no tool needed${sure} (none)`
+  if (d.mode === 'hint') return shadow ? `Jev would hint ${d.tool}${sure} (shadow)` : `Jev hinted ${d.tool}${sure}`
   return `Jev left it to Claude · ${reasonText(d.reason)}`
 }
 
-/** The card the decision runs back to Claude as: Jev picked, Jev answered without the LLM, or Claude decides. */
-export type DecisionCard = 'pick' | 'direct' | 'pass'
+/** The card the decision runs to Claude as: a hint, the choice left to Claude, or Jev failing. */
+export type DecisionCard = 'pick' | 'pass' | 'fail'
 
-export function cardFor(mode: string): DecisionCard {
-  if (mode === 'direct') return 'direct'
-  return mode === 'hint' || mode === 'forced' || mode === 'none' ? 'pick' : 'pass'
+export function cardFor(d: Pick<Decision, 'mode' | 'reason'>): DecisionCard {
+  if (d.mode === 'hint') return 'pick'
+  return /^jev_(error|timeout)\b/.test(d.reason ?? '') ? 'fail' : 'pass'
 }
 
-/** The gateway's requests during one turn. */
-export type GatewayTurn = {
-  requests: number
-  modes: Record<string, number>
+// ---------------------------------------------------------------- one turn's decisions
+
+/**
+ * How a turn is run: `hint` (Jev is asked, Claude gets its hints), `control` (Jev sits it out:
+ * the comparison group), `shadow` (Jev is asked, nothing reaches Claude).
+ */
+export type Arm = 'hint' | 'control' | 'shadow'
+
+export function pickArm(mode: 'on' | 'shadow', controlPercent: number, roll: number): Arm {
+  if (mode === 'shadow') return 'shadow'
+  return roll * 100 < controlPercent ? 'control' : 'hint'
+}
+
+/** Jev's decisions during one turn. */
+export type JevTurn = {
+  asked: number
+  hinted: number
+  /** Hints Claude acted on: it called the hinted tool before Jev was asked again. */
+  followed: number
+  picks: { tool: string; confidence: number }[]
   reasons: Record<string, number>
-  picks: { tool: string; confidence: number; mode: string }[]
-  /** Requests forwarded with routing switched off: the baseline. */
-  baseline: number
-  output: number
-  jevMs: number[]
-  /** Who decided each request, in order: the pane's trail (absent in logs from before 0.4.3). */
-  cards?: DecisionCard[]
+  ms: number[]
+  /** Who decided each request, in order. */
+  cards: DecisionCard[]
 }
 
-export function emptyGatewayTurn(): GatewayTurn {
-  return { requests: 0, modes: {}, reasons: {}, picks: [], baseline: 0, output: 0, jevMs: [], cards: [] }
+export function emptyJevTurn(): JevTurn {
+  return { asked: 0, hinted: 0, followed: 0, picks: [], reasons: {}, ms: [], cards: [] }
 }
 
-export function tallyGateway(turn: GatewayTurn, event: GatewayEvent): void {
-  turn.requests++
-  turn.modes[event.mode] = (turn.modes[event.mode] ?? 0) + 1
-  if (event.reason) {
-    const reason = event.reason.split(':')[0]!
+export function tally(turn: JevTurn, d: Decision, ms: number): void {
+  turn.asked++
+  if (turn.ms.length < 200) turn.ms.push(Math.round(ms))
+  if (turn.cards.length < 200) turn.cards.push(cardFor(d))
+  if (d.mode === 'hint' && d.tool) {
+    turn.hinted++
+    if (turn.picks.length < 50) turn.picks.push({ tool: d.tool, confidence: d.confidence ?? 0 })
+  } else {
+    const reason = (d.reason ?? 'passed').split(':')[0]!
     turn.reasons[reason] = (turn.reasons[reason] ?? 0) + 1
-    if (reason === 'routing_disabled') turn.baseline++
   }
-  if (PICK_MODES.has(event.mode) && event.tool && turn.picks.length < 30) {
-    turn.picks.push({ tool: event.tool, confidence: event.confidence ?? event.jev?.confidence ?? 0, mode: event.mode })
-  }
-  if (event.jev && turn.jevMs.length < 100) turn.jevMs.push(event.jev.latencyMs)
-  const cards = (turn.cards ??= [])
-  if (cards.length < 200) cards.push(cardFor(event.mode))
-  turn.output += event.usage?.output ?? 0
 }
 
 // ---------------------------------------------------------------- the log
 
-/** How the turn's requests went: through the gateway, straight to the API, or why not routed. */
-export type Route = 'gateway' | 'direct' | 'excluded' | 'down'
-
 export type TurnRecord = {
   type: 'turn'
-  v: 3
+  v: 4
   at: number
   session: string
   project: string
   turnId: string
   prompt: string
-  route: Route
+  arm: Arm | 'excluded' | 'off'
   actual: {
     steps: number
     durationMs: number
     reason: string
-    usage?: { input: number; output: number; cacheRead: number; cacheWrite: number }
     tools: number
+    usage?: { input: number; output: number; cacheRead: number; cacheWrite: number }
   }
-  gateway?: GatewayTurn
-  /** Requests sent direct because the gateway stopped answering mid-turn. */
-  fallbacks?: number
+  jev?: JevTurn
 }
 
 export type LogRecord = TurnRecord
@@ -217,55 +394,62 @@ function change(a: number, b: number): string {
   return `${p > 0 ? '+' : ''}${p}%`
 }
 
-const MIN_GROUP = 5
+const pct = (n: number, of: number) => (of > 0 ? `${Math.round((n / of) * 100)}%` : '0%')
+
+export const MIN_GROUP = 5
 
 export function report(records: readonly LogRecord[], days: number): string {
-  const turns = records.filter(r => r.type === 'turn' && r.v === 3)
+  const turns = records.filter(r => r.type === 'turn' && r.v === 4)
   if (turns.length === 0) return `Jev report (last ${days} days): no turns logged yet.`
-  const lines: string[] = []
-  const byRoute = new Map<Route, number>()
-  for (const t of turns) byRoute.set(t.route, (byRoute.get(t.route) ?? 0) + 1)
-  lines.push(`Jev report, last ${days} days: ${turns.length} turns · ${[...byRoute.entries()].map(([r, n]) => `${n} ${r === 'gateway' ? 'through the gateway' : r === 'direct' ? 'direct' : r === 'excluded' ? 'in excluded repos' : 'direct while the gateway was down'}`).join(' · ')}.`)
-  const fallbacks = turns.reduce((s, t) => s + (t.fallbacks ?? 0), 0)
-  if (fallbacks > 0) lines.push(`The gateway stopped answering during ${turns.filter(t => t.fallbacks).length} turn(s); ${fallbacks} request(s) went direct instead of failing.`)
+  const by = (arm: TurnRecord['arm']) => turns.filter(t => t.arm === arm)
+  const hint = by('hint')
+  const control = by('control')
+  const shadow = by('shadow')
+  const rest = turns.length - hint.length - control.length - shadow.length
+  const lines = [
+    `Jev report, last ${days} days: ${turns.length} turns · ${hint.length} with hints · ${control.length} control · ${shadow.length} shadow${rest > 0 ? ` · ${rest} excluded or off` : ''}.`,
+  ]
 
-  const routed = turns.filter(t => t.gateway && t.gateway.requests > 0)
-  if (routed.length === 0) return lines.join('\n')
-  const all = routed.map(t => t.gateway!)
-  const requests = all.reduce((s, g) => s + g.requests, 0)
-  const tally = (pick: (g: GatewayTurn) => Record<string, number>) => {
-    const m = new Map<string, number>()
-    for (const g of all) for (const [k, n] of Object.entries(pick(g))) m.set(k, (m.get(k) ?? 0) + n)
-    return m
+  const asked = [...hint, ...shadow].filter(t => t.jev && t.jev.asked > 0)
+  if (asked.length > 0) {
+    const all = asked.map(t => t.jev!)
+    const sum = (f: (j: JevTurn) => number) => all.reduce((s, j) => s + f(j), 0)
+    const tools = new Map<string, number>()
+    for (const j of all) for (const p of j.picks) tools.set(p.tool, (tools.get(p.tool) ?? 0) + 1)
+    const reasons = new Map<string, number>()
+    for (const j of all) for (const [r, n] of Object.entries(j.reasons)) reasons.set(r, (reasons.get(r) ?? 0) + n)
+    const top = (m: Map<string, number>, label = (k: string) => k) =>
+      [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([k, v]) => `${label(k)} ${v}`)
+        .join(', ')
+    const ms = all.flatMap(j => j.ms)
+    const hinted = hint.reduce((s, t) => s + (t.jev?.hinted ?? 0), 0)
+    const followed = hint.reduce((s, t) => s + (t.jev?.followed ?? 0), 0)
+    lines.push('', `Jev was asked ${sum(j => j.asked)} times and was confident on ${sum(j => j.hinted)} (${pct(sum(j => j.hinted), sum(j => j.asked))}).`)
+    if (hinted > 0) lines.push(`  Claude followed ${followed} of ${hinted} hints (${pct(followed, hinted)}).`)
+    if (tools.size > 0) lines.push(`  Tools Jev picked: ${top(tools)}.`)
+    if (reasons.size > 0) lines.push(`  Left to Claude because: ${top(reasons, reasonText)}.`)
+    if (ms.length > 0) lines.push(`  Jev's latency: p50 ${median(ms)}ms, worst ${Math.max(...ms)}ms (added before each request it is asked about).`)
+    const would = shadow.reduce((s, t) => s + (t.jev?.hinted ?? 0), 0)
+    if (would > 0) {
+      const same = shadow.reduce((s, t) => s + (t.jev?.followed ?? 0), 0)
+      lines.push(`  Shadow: Claude called the tool Jev would have hinted ${same} of ${would} times on its own (${pct(same, would)}).`)
+    }
   }
-  const modes = tally(g => g.modes)
-  const reasons = tally(g => g.reasons)
-  const tools = new Map<string, number>()
-  for (const g of all) for (const p of g.picks) tools.set(p.tool, (tools.get(p.tool) ?? 0) + 1)
-  const top = (m: Map<string, number>, n: number, label = (k: string) => k) =>
-    [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `${label(k)} ${v}`).join(', ')
-  const picked = [...PICK_MODES].reduce((s, m) => s + (modes.get(m) ?? 0), 0)
-  const jevMs = all.flatMap(g => g.jevMs)
 
-  lines.push('', `jev-gateway: ${requests} requests in ${routed.length} turns; Jev chose the tool on ${picked} (${Math.round((picked / requests) * 100)}%).`)
-  lines.push(`  How: ${top(modes, 6)}.`)
-  if (reasons.size > 0) lines.push(`  Left to Claude because: ${top(reasons, 6, reasonText)}.`)
-  if (tools.size > 0) lines.push(`  Tools Jev picked: ${top(tools, 8)}.`)
-  if (jevMs.length > 0) lines.push(`  Jev's latency: p50 ${median(jevMs)}ms, worst ${Math.max(...jevMs)}ms.`)
-
-  const on = routed.filter(t => t.gateway!.baseline === 0)
-  const off = routed.filter(t => t.gateway!.baseline === t.gateway!.requests)
-  lines.push('', 'Routing on vs off (baseline), per turn:')
-  if (on.length >= MIN_GROUP && off.length >= MIN_GROUP) {
-    const perRequest = (g: readonly TurnRecord[]) => median(g.map(t => t.gateway!.output / t.gateway!.requests))
-    const requestsPerTurn = (g: readonly TurnRecord[]) => median(g.map(t => t.gateway!.requests))
+  lines.push('', 'Hints vs control (no hints), per turn:')
+  if (hint.length >= MIN_GROUP && control.length >= MIN_GROUP) {
+    const steps = (g: readonly TurnRecord[]) => median(g.map(t => t.actual.steps))
+    const output = (g: readonly TurnRecord[]) => median(g.map(t => t.actual.usage?.output ?? 0))
     const time = (g: readonly TurnRecord[]) => median(g.map(t => t.actual.durationMs))
-    lines.push(`  output per request ${Math.round(perRequest(on))} vs ${Math.round(perRequest(off))} (${change(perRequest(on), perRequest(off))})`)
-    lines.push(`  requests per turn ${requestsPerTurn(on)} vs ${requestsPerTurn(off)} (${change(requestsPerTurn(on), requestsPerTurn(off))})`)
-    lines.push(`  turn time ${Math.round(time(on) / 1000)}s vs ${Math.round(time(off) / 1000)}s (${change(time(on), time(off))})`)
-    lines.push(`  over ${on.length} turns on and ${off.length} off; medians, so compare similar work.`)
+    lines.push(`  requests per turn ${steps(hint)} vs ${steps(control)} (${change(steps(hint), steps(control))})`)
+    lines.push(`  output tokens per turn ${output(hint)} vs ${output(control)} (${change(output(hint), output(control))})`)
+    lines.push(`  turn time ${Math.round(time(hint) / 1000)}s vs ${Math.round(time(control) / 1000)}s (${change(time(hint), time(control))})`)
+    lines.push(`  over ${hint.length} hinted and ${control.length} control turns; medians, so compare similar work.`)
   } else {
-    lines.push(`  ${on.length} turns on, ${off.length} off: need ${MIN_GROUP} of each. Switch "Jev routing" off in the /jev pane for some similar work.`)
+    lines.push(`  ${hint.length} turns with hints, ${control.length} control: need ${MIN_GROUP} of each. Control turns come up on their own ("Jev: control group" in /config).`)
   }
   return lines.join('\n')
 }
@@ -282,20 +466,22 @@ export function isExcluded(cwd: string, excluded: string): boolean {
     .some(name => parts.includes(name))
 }
 
-export function isValidKey(key: string): boolean {
-  return /^[A-Za-z0-9._\-]{20,300}$/.test(key)
-}
-
 /** The last folder name of a path, on any platform. */
 export function folderName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path
 }
 
-/**
- * Whether a base URL points at the gateway this mod runs on `port`: one an earlier install of the
- * mod left in the environment, not one jev-claude started.
- */
-export function isOwnGateway(baseUrl: string | null | undefined, port: number): boolean {
+/** `http://127.0.0.1:8789` from a base URL that points at a gateway on this machine, else undefined. */
+export function localGatewayOrigin(baseUrl: string | null | undefined): string | undefined {
+  const m = /^(https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+)(?:\/|$)/.exec(baseUrl?.trim() ?? '')
+  return m ? m[1] : undefined
+}
+
+/** The port mod versions up to 0.4 ran jev-gateway on; a session may still point at it. */
+export const OLD_GATEWAY_PORT = 8794
+
+/** Whether a base URL points at a local gateway on `port`. */
+export function isGatewayOn(baseUrl: string | null | undefined, port: number): boolean {
   const origin = localGatewayOrigin(baseUrl)
   return origin !== undefined && Number(origin.split(':').pop()) === port
 }
@@ -304,7 +490,10 @@ export function isOwnGateway(baseUrl: string | null | undefined, port: number): 
 
 /** A prompt as one clean line: pasted-image markers and runs of whitespace gone. */
 export function cleanPrompt(text: string): string {
-  return text.replace(/\[(?:Image|Pasted text) #\d+[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim()
+  return text
+    .replace(/\[(?:Image|Pasted text) #\d+[^\]]*\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 /** `Read ×3 · Bash ×2`: the tools Jev picked, most picked first. */
@@ -331,10 +520,4 @@ export function tokens(n: number): string {
 /** `640ms`, `1.7s`. */
 export function latency(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
-}
-
-/** `http://127.0.0.1:8789` from a base URL that points at a gateway on this machine, else undefined. */
-export function localGatewayOrigin(baseUrl: string | null | undefined): string | undefined {
-  const m = /^(https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+)(?:\/|$)/.exec(baseUrl?.trim() ?? '')
-  return m ? m[1] : undefined
 }

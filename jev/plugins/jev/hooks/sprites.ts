@@ -1,7 +1,8 @@
-// Pixel scenes for the band above the prompt: Claude (the orange pixel mascot, on the
-// left: it starts every exchange) and Jev (a teal owl, the judge, on the right), animated by what is really happening in the turn: who
-// is sending what to whom, and who is working. 4 pixels tall, two per terminal cell,
-// so the scene is 2 rows. Pure: tests run it as is.
+// Pixel scenes for the band above the prompt: Claude (the orange pixel mascot, on the left: it
+// starts every exchange) and Jev (a teal owl, the judge, on the right). Only the one doing the work
+// moves, and information shows as a particle exactly while it travels: the conversation going to
+// Jev, Jev's answer coming back. 4 pixels tall, two per terminal cell, so the scene is 2 rows.
+// Pure: tests run it as is.
 
 /** One scene pixel: an RGB color, or null for the terminal's own background. */
 type Px = number | null
@@ -21,31 +22,50 @@ export const COLORS = {
   claudeDim: 0x8a6a5e,
   claudeEye: 0x1a1a1a,
   trail: 0x6c7680,
+  /** The conversation on its way to Jev. */
   packet: 0xe6edf3,
-  /** The reply streaming back to Claude: a warm lane beside the light one. */
-  stream: 0xf4a582,
+  /** Claude writing its next request: dots beside its head. */
+  thought: 0xf4a582,
   spark: 0xffd166,
-  /** Card colors: what jev-gateway did with the request. */
+  /** Card colors: what Jev answered. */
   pick: 0x4cc9f0,
-  direct: 0x06d6a0,
   pass: 0x6c7680,
+  fail: 0xef476f,
 } as const
 
 /**
- * One model request through jev-gateway:
- * - `asking`: the request leaves Claude for the gateway (a packet runs Claude → Jev), then Jev
- *   decides, its eyes darting.
- * - `streaming`: the model's reply streams back to Claude, two lanes of dots flowing right to
- *   left, for as long as the request is in flight; Claude blinks while it thinks.
- * - `answering`: the gateway's decision runs back to Claude as a card: cyan when Jev picked the
- *   tool, green when Jev answered without the LLM, grey when it left the choice to Claude.
- * - `working`: Claude acts on it (legs stepping, a spark per tool call); Jev watches.
+ * What the turn is doing, one actor at a time:
+ * - `asking`: the conversation leaves Claude for Jev (a packet runs Claude → Jev), then Jev
+ *   decides, its eyes darting, for exactly as long as the call to Jev takes. Claude waits.
+ * - `answering`: Jev's answer runs back to Claude as a card: cyan for a hint, grey when Jev left
+ *   the choice to Claude, red when Jev failed. In shadow the card stays with Jev: Claude never
+ *   sees it.
+ * - `thinking`: Claude's request is with its model: Claude glances and blinks, dots appear beside
+ *   its head, a hint it carries rests by it. Jev holds still.
+ * - `working`: Claude runs tools: its legs step, a spark flashes per call (still lit as the next
+ *   request starts, when the call was too quick to see). Jev holds still.
  */
-export type Scene = 'unset' | 'idle' | 'asking' | 'streaming' | 'answering' | 'working' | 'error'
-export type Card = 'pick' | 'direct' | 'pass' | 'none'
+export type Scene = 'unset' | 'idle' | 'asking' | 'answering' | 'thinking' | 'working'
+export type Card = 'pick' | 'pass' | 'fail' | 'none'
+
+/** One frame of the band: the scene, how far into it, and how the turn is run. */
+export type SceneState = {
+  scene: Scene
+  frame: number
+  /** Jev's newest answer in this turn. */
+  card: Card
+  /** A tool call just started. */
+  spark: boolean
+  /** Jev sits the turn out (a control turn, or paused): the owl sleeps. */
+  asleep: boolean
+  /** Jev is asked, but its answers never reach Claude. */
+  shadow: boolean
+}
+
+export const STILL: Omit<SceneState, 'scene'> = { frame: 0, card: 'none', spark: false, asleep: false, shadow: false }
 
 /** Scenes that move; the rest hold still. */
-export const ANIMATED: ReadonlySet<Scene> = new Set(['asking', 'streaming', 'answering', 'working'])
+export const ANIMATED: ReadonlySet<Scene> = new Set(['asking', 'answering', 'thinking', 'working'])
 
 /** Frames the packet takes to cross, before Jev starts working. */
 export const TRAVEL_FRAMES = 4
@@ -54,107 +74,111 @@ export const ANSWER_FRAMES = 7
 
 const MID = 8
 const BLANK = '.'.repeat(MID)
+const TRAIL = '..g..g..'
 
 function put(row: string, at: number, text: string): string {
   return row.slice(0, at) + text + row.slice(at + text.length)
 }
 
-/** Jev is working while it holds a request: its eyes look around and blink. */
-function jevWorking(scene: Scene, frame: number): boolean {
-  return scene === 'asking' && frame >= TRAVEL_FRAMES
-}
-
 // The owl's eye row: pupils left (at Claude), pupils right, or eyes shut.
 const OWL_EYES = { left: 'tkwtkwt', right: 'twktwkt', shut: 'ttttttt' } as const
 
-/** With Jev routing off (the baseline) the owl sleeps: requests pass it by. */
-function jev(scene: Scene, frame: number, asleep: boolean): string[] {
-  const look: keyof typeof OWL_EYES =
-    asleep && scene !== 'error'
-      ? 'shut'
-      : jevWorking(scene, frame)
-        ? (['left', 'right', 'left', 'right', 'shut'] as const)[(frame - TRAVEL_FRAMES) % 5]!
-        : scene === 'streaming' && frame % 8 === 7
-          ? 'shut'
-          : 'left'
+/** The owl moves only while it holds a request: the one moment it works. */
+function jev(s: SceneState): string[] {
+  const deciding = s.scene === 'asking' && s.frame >= TRAVEL_FRAMES
+  const look: keyof typeof OWL_EYES = s.asleep
+    ? 'shut'
+    : deciding
+      ? (['left', 'right', 'left', 'right', 'shut'] as const)[(s.frame - TRAVEL_FRAMES) % 5]!
+      : 'left'
   return ['t.....t', '.ttttt.', OWL_EYES[look], '.ttatt.']
 }
 
-function claude(scene: Scene, frame: number): string[] {
-  const working = scene === 'working'
-  const legs = working && frame % 2 === 1 ? 'o.o..o.o' : '.o.oo.o.'
-  // eyes close for one frame now and then while it works or thinks
-  const blink = (working && frame % 9 === 8) || (scene === 'streaming' && frame % 7 === 6)
-  return ['.oooooo.', blink ? '.oooooo.' : '.okooko.', 'oooooooo', legs]
+// Claude's eye row: looking ahead, glancing toward Jev, or blinking.
+const CLAUDE_EYES = { ahead: '.okooko.', glance: '.ookook.', shut: '.oooooo.' } as const
+
+/** Claude moves only while it works: thinking (glances, blinks) or running tools (steps). */
+function claude(s: SceneState): string[] {
+  const f = s.frame
+  const working = s.scene === 'working'
+  const eyes: keyof typeof CLAUDE_EYES =
+    s.scene === 'thinking' ? (f % 10 === 8 ? 'shut' : f % 10 >= 4 && f % 10 <= 6 ? 'glance' : 'ahead') : working && f % 9 === 8 ? 'shut' : 'ahead'
+  const legs = working && f % 2 === 1 ? 'o.o..o.o' : '.o.oo.o.'
+  return ['.oooooo.', CLAUDE_EYES[eyes], 'oooooooo', legs]
 }
 
-/** A lane of dots `period` apart that moves one pixel left per frame. */
-function lane(frame: number, offset: number, ch: string, period = 4): string {
-  return [...BLANK].map((_, c) => ((c + frame + offset) % period === 0 ? ch : '.')).join('')
+/** Where an answer rests once it has landed: by Claude, or with Jev in shadow. Only a hint rests. */
+function resting(s: SceneState): number | undefined {
+  if (s.card !== 'pick') return undefined
+  return s.shadow ? MID - 2 : 0
 }
 
-function middle(scene: Scene, frame: number, spark: boolean, card: Card): string[] {
-  switch (scene) {
-    case 'idle':
-    case 'error':
-      return [BLANK, BLANK, '..g..g..', BLANK]
+function middle(s: SceneState): string[] {
+  const f = s.frame
+  switch (s.scene) {
     case 'unset':
       return [BLANK, BLANK, BLANK, BLANK]
+    case 'idle':
+      return [BLANK, BLANK, TRAIL, BLANK]
     case 'asking': {
-      if (frame < TRAVEL_FRAMES) {
-        // the packet runs from Claude (left) to Jev (right)
-        const at = Math.min(MID - 2, frame * 2)
+      if (f < TRAVEL_FRAMES) {
+        // the conversation runs from Claude (left) to Jev (right)
+        const at = Math.min(MID - 2, f * 2)
         return [BLANK, BLANK, put(BLANK, at, 'pp'), BLANK]
       }
       // Jev works: a pulse of dots next to it
-      const dots = frame % 3 === 0 ? '.......g' : frame % 3 === 1 ? '.....g.g' : '...g.g.g'
+      const dots = f % 3 === 0 ? '.......g' : f % 3 === 1 ? '.....g.g' : '...g.g.g'
       return [BLANK, BLANK, dots, BLANK]
     }
-    case 'streaming':
-      // the reply flows from the model, past Jev, back to Claude
-      return [BLANK, lane(frame, 0, 'p'), lane(frame, 2, 's'), BLANK]
     case 'answering': {
-      // the card runs from Jev (right) to Claude (left)
-      const at = MID - 2 - Math.min(frame, ANSWER_FRAMES - 1)
+      // the card runs from Jev (right) to Claude (left); in shadow it never leaves Jev
+      const at = s.shadow ? MID - 2 : MID - 2 - Math.min(f, ANSWER_FRAMES - 1)
       const card = put(BLANK, at, 'cc')
       return [BLANK, card, card, BLANK]
     }
+    case 'thinking':
     case 'working': {
-      // Jev's answer rests by Claude, a dim trail behind it; a spark flashes on a tool call
-      const top = spark ? put(BLANK, 0, 'y') : BLANK
-      if (card === 'none') return [top, BLANK, '..g..g..', BLANK]
-      const rest = put(BLANK, 0, 'cc')
-      return [top, rest, put('..g..g..', 0, 'cc'), BLANK]
+      // Claude's own activity sits by Claude: the dots of a request being written, and a tool's
+      // spark, which outlasts a call too quick to see by a frame or two
+      const dots = s.scene === 'thinking' ? (['t.......', 't.t.....', 't.t.t...', BLANK] as const)[f % 4]! : BLANK
+      const top = s.spark ? put(dots, 0, 'y') : dots
+      const at = resting(s)
+      if (at === undefined) return [top, BLANK, TRAIL, BLANK]
+      return [top, put(BLANK, at, 'cc'), put(TRAIL, at, 'cc'), BLANK]
     }
   }
 }
 
 export const SCENE_ROWS = 2
 
-/** The scene's pixels at `frame`: Claude, what passes between them, Jev (asleep with routing off). */
-export function scenePixels(scene: Scene, card: Card = 'none', frame = 0, spark = false, asleep = false): Px[][] {
-  const dim = scene === 'unset'
+/** The scene's pixels: Claude, what passes between them, Jev. */
+export function scenePixels(s: SceneState): Px[][] {
+  const dim = s.scene === 'unset'
+  const failed = s.scene === 'answering' && s.card === 'fail'
   const palette: Record<string, number | undefined> = {
-    a: scene === 'error' ? COLORS.error : dim ? COLORS.jevDim : COLORS.beak,
+    a: dim ? COLORS.jevDim : COLORS.beak,
     t: dim ? COLORS.jevDim : COLORS.jev,
     w: dim ? 0x9aa3ab : COLORS.visor,
-    k: scene === 'error' ? COLORS.error : COLORS.pupil,
+    // the owl's eyes turn red while a failed answer travels
+    k: failed ? COLORS.error : COLORS.pupil,
+  }
+  const between: Record<string, number | undefined> = {
     g: COLORS.trail,
     p: COLORS.packet,
-    s: COLORS.stream,
-    c: card === 'none' ? undefined : COLORS[card],
+    t: COLORS.thought,
+    c: s.card === 'none' ? undefined : COLORS[s.card],
     y: COLORS.spark,
   }
   const body = dim ? COLORS.claudeDim : COLORS.claude
-  const j = jev(scene, frame, asleep)
-  const m = middle(scene, frame, spark, card)
-  const c = claude(scene, frame)
+  const j = jev(s)
+  const m = middle(s)
+  const c = claude(s)
   const rows: Px[][] = []
   for (let r = 0; r < 4; r++) {
     const row: Px[] = []
     for (const ch of c[r]!) row.push(ch === 'o' ? body : ch === 'k' ? COLORS.claudeEye : null)
     row.push(null)
-    for (const ch of m[r]!) row.push(palette[ch] ?? null)
+    for (const ch of m[r]!) row.push(between[ch] ?? null)
     row.push(null)
     for (const ch of j[r]!) row.push(palette[ch] ?? null)
     rows.push(row)

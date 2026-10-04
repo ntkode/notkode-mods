@@ -1,69 +1,67 @@
 /** The last finished turn as the pane draws it. */
 export type JevTurnView = {
   prompt: string
-  route: 'gateway' | 'direct' | 'excluded' | 'down'
+  arm: 'hint' | 'control' | 'shadow' | 'excluded' | 'off'
   steps: number
   durationMs: number
   output?: number
-  fallbacks?: number
-  gateway?: {
-    requests: number
-    modes: Record<string, number>
-    reasons: Record<string, number>
+  jev?: {
+    asked: number
+    hinted: number
+    followed: number
     picks: string[]
-    jevMs?: number
-    /** Who decided each request, in order: `pick`, `direct` or `pass`. */
-    cards?: string[]
+    reasons: Record<string, number>
+    /** Jev's median latency this turn. */
+    ms?: number
+    /** What Jev answered each time it was asked, in order: `pick` (a hint), `pass` or `fail`. */
+    cards: string[]
   }
 }
 
 /** This session's running totals. */
 export type JevSessionView = {
   turns: number
-  routed: number
+  hintTurns: number
+  controlTurns: number
   requests: number
-  picked: number
-  fallbacks: number
-  /** Output tokens of the routed turns. */
-  output?: number
+  asked: number
+  hinted: number
+  followed: number
+  output: number
   /** Jev's median latency per turn, newest last. */
-  jevMs?: number[]
+  jevMs: number[]
 }
 
 /**
- * Where jev-gateway stands for this session:
- * off (switched off in /config), not_installed (no gateway, or no Node.js it runs on), no_key,
- * starting, up, down (not answering: the session went direct), excluded (a repo whose
- * conversations stay out of Jev), external (the session was started through `jev-claude`, whose
- * gateway the mod watches but does not run).
+ * Whether Jev can be asked in this session: off (switched off in /config), no_key (run
+ * /jev-setup), ready, excluded (a repo whose conversations stay out of Jev).
  */
-export type JevGatewayState = 'off' | 'not_installed' | 'no_key' | 'starting' | 'up' | 'down' | 'excluded' | 'external'
+export type JevReadiness = 'off' | 'no_key' | 'ready' | 'excluded'
+
+/** How a turn is run: Jev's hints reach Claude, Jev sits out (control), Jev is asked in shadow, or not at all (paused). */
+export type JevArm = 'hint' | 'control' | 'shadow' | 'off'
 
 declare module 'claude-code' {
   interface PluginState {
     jev: {
+      status: {
+        state: JevReadiness
+        mode: 'on' | 'shadow' | 'off'
+        /** Where Jev is reached (`OpenRouter`). */
+        provider?: string
+        /** This session's requests go through a local proxy (a jev-gateway hints too). */
+        gateway?: string
+        /** Jev is not asked in this session until it is resumed (the pane's switch). */
+        paused?: boolean
+      }
       last: JevTurnView | null
       session: JevSessionView
-      gateway: {
-        state: JevGatewayState
-        origin?: string
-        /** This session's model requests go through the gateway now. */
-        routed: boolean
-        /** The person switched routing off for this session in the pane. */
-        paused?: boolean
-        /** Jev routing inside the gateway; off makes it a metering proxy (the baseline). */
-        routing?: boolean
-        minConfidence?: number
-        pid?: number
-        /** What went wrong or what to do next, in a few words (`run /jev-setup`). */
-        note?: string
-      }
-      /** ANTHROPIC_BASE_URL as the session started, restored whenever routing stops. */
+      /** What the running turn is doing, and since when: the animation's clock. */
+      phase: { name: 'asking' | 'thinking' | 'working'; at: number; arm: JevArm; tool?: string } | null
+      /** Jev's newest answer in the running turn. */
+      decision: { mode: 'hint' | 'pass'; tool?: string; confidence?: number; reason?: string; shadow?: boolean; at: number } | null
+      /** ANTHROPIC_BASE_URL before v0.4 routed the session through its gateway: read once, to undo that. */
       original: { saved: boolean; value: string | null }
-      /** The running request, and since when: the animation's clock. */
-      phase: { name: 'asking' | 'working'; at: number } | null
-      /** The gateway's decision on the newest request of the running turn. */
-      decision: { mode: string; tool?: string; confidence?: number; reason?: string; at: number } | null
     }
   }
 }

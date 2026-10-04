@@ -1,7 +1,7 @@
 {
   "name": "jev",
-  "version": "0.4.3",
-  "description": "Runs jev-gateway for Claude Code from inside the session: Jev picks the next tool on each request, shown live, measured against a baseline",
+  "version": "0.5.0",
+  "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"
   },
@@ -11,32 +11,32 @@
   "keywords": [
     "jev",
     "typesafe",
-    "jev-gateway",
     "tool-routing",
     "mod"
   ],
   "types": "./types/index.d.ts",
   "userConfig": {
-    "gateway": {
+    "mode": {
       "type": "string",
-      "title": "Jev: route through jev-gateway",
-      "description": "on: the mod starts jev-gateway and sends this session's model requests through it (straight to the API again the moment it stops answering). off: requests go straight to the API.",
+      "title": "Jev: hints",
+      "description": "on: Jev is asked before Claude's requests and Claude gets its confident picks as a hint. shadow: Jev is asked and its picks are recorded, but nothing reaches Claude. off: Jev is never asked.",
       "options": [
         "on",
+        "shadow",
         "off"
       ],
       "default": "on"
     },
-    "port": {
+    "controlPercent": {
       "type": "number",
-      "title": "Jev: gateway port",
-      "description": "The local port the mod runs jev-gateway on (127.0.0.1 only).",
-      "default": 8794
+      "title": "Jev: control group (%)",
+      "description": "With hints on, this share of turns runs without Jev, so /jev-report can compare hints with no hints on your own work. 0 turns it off.",
+      "default": 20
     },
     "excludedRepos": {
       "type": "string",
       "title": "Jev: excluded repos",
-      "description": "Comma-separated folder names. Sessions in these folders never go through the gateway, so their conversations are not sent to Jev.",
+      "description": "Comma-separated folder names. Sessions in these folders never ask Jev, so their conversations are not sent to it, and their prompts stay out of the log.",
       "default": ""
     }
   }

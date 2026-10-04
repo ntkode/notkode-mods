@@ -13,7 +13,7 @@ Update the list with `/plugin marketplace update notkode-mods`.
 
 | Plugin | What it does | Source |
 |---|---|---|
-| `jev` | Runs [jev-gateway](https://github.com/vinilana/jev-gateway) from inside Claude Code: Jev, TypeSafe's fast decision model, picks the next tool on each request, shown live and measured against a baseline. After installing, run `/jev-setup`. | [`jev/`](jev/) |
+| `jev` | Jev, TypeSafe's fast decision model, picks the tool that fits Claude's next step, and Claude gets it as a hint. Shown live above the prompt, measured against a control group of turns without Jev. After installing, run `/jev-setup`. | [`jev/`](jev/) |
 
 ## Adding a plugin
 

@@ -1,113 +1,108 @@
 # jevMod: plan and handoff
 
 Where the project stands, what has been proven, and what to build next. Updated 2026-10-03, at
-the end of the session that finished v0.4.
+the end of the session that finished v0.5.
 
 ## The decision
 
 jevMod is a **standalone, open-source Claude Code plugin** (`jev`), distributed through the
 [notkode-mods](https://github.com/ntkode/notkode-mods) marketplace with the other Notkode plugins.
 
-1. **First feature: run [jev-gateway](https://github.com/vinilana/jev-gateway) from inside Claude Code.**
-   The gateway asks Jev which tool fits on every model request and steers Claude when Jev is
-   confident. The plugin installs it, starts it, routes the session through it, falls back to
-   direct if it stops answering, shows its decisions live, and measures routing on vs off.
+1. **First feature: Jev's tool hints, native to Claude Code.** Before Claude's requests the mod
+   asks Jev which tool fits and, when Jev is confident, Claude reads it as a hint. v0.4 did this by
+   running [jev-gateway](https://github.com/vinilana/jev-gateway) as a proxy; v0.5 asks Jev
+   itself, with jev-gateway's questions and rule ported (MIT, credited), and nothing else of the
+   gateway's machinery.
 2. **Then: research.** New Jev use cases found online go through the funnel in `CLAUDE.md`:
    backtest on real transcripts, then shadow, then live with a control group, then keep or drop.
 
-Why standalone and not a fork: the plugin only *uses* the gateway (its npm package, its launcher,
-its setup code and its local HTTP API) and never changes its code. Keeping it standalone keeps the
-author's autonomy over releases and experiments. Because the plugin installs a pinned gateway
-version itself, versions can't drift apart.
+## Current state: v0.5 works, not released
 
-## Current state: v0.4 works, not released
+v0.5 drops the gateway. jev-gateway's only effect in Claude Code was a hint (with thinking on, the
+API refuses a forced tool, and touching `tool_choice` breaks the prompt cache), yet it took Node,
+npm, a background proxy for all traffic, a guard, fallbacks and a watchdog. The mod now asks Jev
+itself and passes the hint through the hook API.
 
-`claude plugin validate` passes, `claude plugin test` passes 33 of 33,
-and `tsc` is clean. On macOS it has been run for real, headless and interactive, against
-jev-gateway 0.5.0 with an OpenRouter key.
+`claude plugin validate` passes, `claude plugin test` passes 44 of 44, and `tsc` is clean. Run for
+real on macOS (interactive, tmux) with an OpenCode key.
 
 | File | What it holds |
 |---|---|
-| `plugins/jev/.claude-plugin/plugin.json` | v0.4.0; options `gateway` (on/off), `port` (8794), `excludedRepos` (empty) |
-| `plugins/jev/types/index.d.ts` | state contract: `gateway` (state, routed, paused, routing, note…), `original`, `phase`, `decision`, `last`, `session` |
-| `plugins/jev/hooks/register.tsx` | the runner: setup, start, the guard, the watchdog, event polling, band, pane, log, commands |
-| `plugins/jev/hooks/logic.ts` | pure: key file and provider rule, upstream, Node check, decision text, tally, report |
-| `plugins/jev/hooks/sprites.ts` | owl scenes; cards cyan (pick), green (direct), grey (pass); red eye when down |
-| `plugins/jev/scripts/save-key.mjs` | checks and saves the key through the gateway's own `bin/setup.mjs`; key on stdin only |
-| `plugins/jev/tests/*.test.ts` | 33 tests: routing, fallback and restart, watchdog, subagents, excluded, off, external, setup, band, pane, scene |
+| `plugins/jev/.claude-plugin/plugin.json` | v0.5.0; options `mode` (on/shadow/off), `controlPercent` (20), `excludedRepos` (empty) |
+| `plugins/jev/types/index.d.ts` | state contract: `status`, `phase`, `decision`, `last`, `session`, and `original` (read once, to undo v0.4's routing) |
+| `plugins/jev/hooks/register.tsx` | asking Jev (prompt.submit, tool.call), turns and arms, band, pane, log, setup, commands |
+| `plugins/jev/hooks/logic.ts` | pure: providers and key rule, state builder, questions and shortlist, the decision rule, tally, log, report |
+| `plugins/jev/hooks/sprites.ts` | the band's scenes: only the actor at work moves; cards cyan (hint), grey (pass), red (failed) |
+| `plugins/jev/tests/*.test.ts` | 44 tests: the rule, the key, the report, the hooks end to end (hint, parallel calls, timeout, failure, control, shadow, excluded, off, no key, setup, v0.4 leftover, pane, pause), the scenes |
 
 ### How it works
 
-- **Setup** (`/jev-setup`, every step asked): Node.js ≥ 22.15 check; `npm install
-  jev-gateway@0.5.0` into `~/.claude/jev-mod/gateway/0.5.0`; key from the clipboard, checked and
-  saved to `~/.jev-gateway/.env` (0600) by `save-key.mjs`, clipboard cleared; an existing key
-  (file or environment) is found and kept.
-- **Start**: `node …/bin/jev-claude.mjs --start` with `JEV_CLAUDE_PORT` and
-  `JEV_CLAUDE_UPSTREAM_BASE_URL`. The launcher detaches the gateway and keeps its pid and log; the
-  gateway outlives the session. Awaited at session start, so the first request is routed.
-- **Routing**: `ANTHROPIC_BASE_URL` set per request by the guard in `turn.step` (subagents too):
-  `/health`, cached 1s, 800ms timeout. Down: the original URL goes back *before* the request
-  leaves, a fallback is counted, one toast, and the next turn restarts the gateway in the
-  background. A watchdog (every 5s) does the same between turns. The original URL is saved once
-  in state and restored whenever routing stops.
-- **Modes**: off (the session goes as it started), excluded (direct; prompts not logged),
-  not_installed / no_key (band says `/jev-setup`), up, down, external (started through
-  `jev-claude`: watched and guarded, never started or stopped; direct means the Anthropic
-  default).
-- **Decisions**: `/dashboard/events` polled after each main-loop request, 400ms later, and at
-  turn end. A restart is detected by `startedAt` (the gateway replays its log, so `recorded`
-  alone is not enough).
-- **Seen**: band (owl scene, the decision line), pane (`/jev`: state, last turn, totals, buttons
-  for pause, Jev routing, restart, dashboard URL, report), `/jev-report` (routing on vs off, needs
-  5 turns of each), log in `~/.claude/jev-mod/log/` (v3 records).
+- **When Jev is asked**: on `prompt.submit` (before a turn's first request; the hint rides as
+  `context` beside the prompt) and in `tool.call` after the last call of a response finishes (the
+  hint rides as `context` after that tool result). One ask per model request, main loop only.
+  The response's call count comes from `turn.step`'s result; a call waits for it (10s at most).
+- **What Jev reads**: `$.session.messages()` (plus the new prompt, or the batch's results not
+  stored yet), cut to 60k characters, newest first; `$.tool.list()` names and descriptions,
+  shortlisted in one extra call past 120 tools. jev-gateway's two questions, its rule (≥ 0.7,
+  both answers agree, never hint "no tool") and its hint wording, ported with credit.
+- **Budget**: 4s per ask, one retry on 408/429/5xx; failing or slow is a pass (`jev_error`,
+  `jev_timeout`), and the request goes on without a hint.
+- **Arms**: each turn is drawn at `prompt.submit`: `hint`, or `control` (20%: Jev not asked),
+  `shadow` with mode shadow (asked, recorded, nothing reaches Claude), `excluded`, `off` (paused
+  from the pane). "Followed": the next response called the tool Jev pointed at.
+- **Key**: `~/.jev-gateway/.env`, jev-gateway's own file, so keys are shared both ways;
+  environment variables win. `/jev-setup` reads the clipboard, checks the key with one call to
+  Jev, writes the file with `upsertEnv`, `chmod 600`, and clears the clipboard.
+- **v0.4 leftover**: a session still pointing at `127.0.0.1:8794` is sent back to the URL saved in
+  `original` (or the default). The old gateway process is not stopped (README says how).
+- **Seen**: band (scene, then the status line with the routing setting under it), pane (`/jev`),
+  `/jev-report` (hints vs control, 5 turns of each), log in `~/.claude/jev-mod/log/` (v4 records).
 
-## Verified (2026-10-03, macOS)
+## Verified
 
-- [x] Headless: the plugin starts the gateway and the first request goes through it (Jev
-      answered in 569ms; turn logged as `gateway`).
-- [x] Headless: gateway killed mid-turn by Claude's own Bash call. The next request went direct
-      (`fallbacks: 1`) and the turn finished. The next session restarted the gateway.
-- [x] External mode: a session started with `ANTHROPIC_BASE_URL` at a `jev-claude` gateway (8789)
-      went through it, and the plugin started nothing.
-- [x] Excluded repo: nothing started, the request went direct, and the log kept no prompt.
-- [x] **Interactive** session (tmux): band "Jev picked Read 0.99 (hint)" mid-turn; pane correct;
-      gateway killed while idle → watchdog let go, the next turn went direct and restarted it.
-- [x] Marketplace install loads the hooks module like `--plugin-dir`: the gateway started from
-      that install alone (isolated `CLAUDE_CONFIG_DIR`).
-- [x] From GitHub, as users will: `/plugin marketplace add ntkode/notkode-mods` +
-      `/plugin install jev@notkode-mods` installs `plugins/jev` from this repo (private repos
-      both; git used the `gh` login over https).
+v0.5 (2026-10-03, macOS, interactive in tmux, OpenCode free model):
+
+- [x] Loads from `--plugin-dir` with the marketplace v0.4.3 copy disabled; band "Jev idle" over
+      "routing on".
+- [x] A turn with a Bash call: "Jev deciding…" → "Jev left it to Claude · Jev was unsure" →
+      "Claude thinking…" → "Claude working · Bash" → "Jev deciding…" → "… · no tool needed" →
+      "Claude thinking…" → idle. Jev answered in 1.3s per ask.
+- [x] A control turn drawn at random: "routing on · control turn, no hints", the owl asleep.
+- [x] Pane: last turn's asks, reasons, latency; session tiles.
+
+v0.4 (gateway version, for the record): headless and interactive runs, fallback mid-turn,
+external `jev-claude` mode, excluded repos, the marketplace install from GitHub.
+
 - [x] Licence: jev-gateway is MIT (package and LICENSE); jevMod is MIT.
 
 ## Still open before release
 
-- [ ] **Windows.** Untested. Designed for it: `node` with no shell, the gateway's own launcher
-      (cross-platform), `npm` → `npm.cmd` → `cmd /c npm`, `USERPROFILE` fallback, PowerShell
-      clipboard, backslash paths in exclusions. Needs one real run.
+- [ ] **A hint seen live**: the first live run's asks were all passes (unsure, no tool needed).
+      Check a confident pick reaches Claude as `context` and shows cyan.
+- [ ] **Windows.** Untested: `USERPROFILE` fallback, PowerShell clipboard, backslash paths in
+      exclusions, no `chmod`. Needs one real run.
 - [ ] **Make the repository public** (`ntkode/notkode-mods`, which now holds jev too, is
       private for now).
-- [ ] `/jev-setup` itself driven end to end on a clean machine (its parts ran for real: npm
-      install, launcher, save-key's gateway code; the dialog flow ran in tests only).
+- [ ] `/jev-setup` driven end to end on a clean machine (the dialog flow ran in tests only).
 - [ ] Linux clipboard (`wl-paste`, `xclip`) untested.
 
 ## Known limits (in the README)
 
-- One gateway per port, shared by every session on it; events carry no session id, so
-  concurrent sessions count each other's requests.
-- The launcher's pid and log files are per client, not per port: `jev-claude --stop` can stop the
-  plugin's gateway (it restarts on the next turn). Upstream fix drafted.
+- Main conversation only: subagents get no hints.
+- A hint stays in the conversation with the prompt or tool result it rode on (about 30–40 tokens).
+- Each ask adds Jev's latency before the request it is about.
 - Options are per install key (`jev@inline` vs `jev@notkode-mods`): excluded repos must be set again
   after switching from `--plugin-dir` to the marketplace install.
-- No unload event: uninstalling mid-session leaves the session pointed at the gateway until the
-  session ends.
 
 ## Next steps, in order
 
-1. Run it on Windows once; fix what breaks.
-2. Make both repositories public; install on a second machine; drive `/jev-setup` there.
-3. Open the issues drafted in `research/upstream/jev-gateway.md` (README link, per-port pid/log
-   files, fast-lane proposal).
-4. Use it: switch Jev routing off for some similar work and read `/jev-report` once both groups
-   have 5 turns. That is idea 1's live stage; write `research/results/06-…` with the numbers.
-5. Research funnel: idea 9 was parked at step 2 (`results/05-proceed.md`). Next candidates in
+1. See a hint live (above); then release v0.5.0 (the marketplace description and the root README
+   row already describe it).
+2. Run it on Windows once; fix what breaks.
+3. Make the repository public; install on a second machine; drive `/jev-setup` there.
+4. Use it: read `/jev-report` once hints and control have 5 turns each. That is idea 1's live
+   stage; write `research/results/07-…` with the numbers.
+5. Open the issues drafted in `research/upstream/jev-gateway.md` that still apply (README link,
+   fast-lane proposal).
+6. Research funnel: idea 9 was parked at step 2 (`results/05-proceed.md`). Next candidates in
    `research/ideas.md`: 8 (browser guard, outside Jev), 10 (Laya), 11 (batch classification).

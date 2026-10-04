@@ -1,85 +1,92 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginState, Register, RenderElement } from 'claude-code'
+import type { EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { JevSessionView, JevTurnView } from '../types'
+import type { JevArm, JevReadiness, JevSessionView, JevTurnView } from '../types'
 
 import {
-  ANTHROPIC_UPSTREAM,
-  DEFAULT_PORT,
-  GATEWAY_PROVIDERS,
-  GATEWAY_VERSION,
-  PICK_MODES,
+  JEV_TIMEOUT_MS,
+  MAX_TOOLS,
+  OLD_GATEWAY_PORT,
+  PROVIDERS,
+  buildState,
   cardFor,
-  decisionText,
-  emptyGatewayTurn,
-  folderName,
   cleanPrompt,
+  decide,
+  decisionText,
   duration,
+  emptyJevTurn,
+  folderName,
+  hintText,
   isExcluded,
-  isOwnGateway,
+  isGatewayOn,
   isValidKey,
+  jevAccess,
   latency,
-  keyProvider,
   localGatewayOrigin,
   median,
-  nodeVersionOk,
+  normalizeAnswers,
   parseEnvFile,
   parseLog,
+  pickArm,
   reasonText,
   report,
-  tallyGateway,
+  shortlistQuestions,
+  shortlisted,
+  skipReason,
+  tally,
   tokens,
   toolCounts,
-  upstreamFor,
+  toolQuestions,
+  turnsFrom,
+  upsertEnv,
 } from './logic'
-import type { GatewayEvent, GatewayProvider, GatewayTurn, LogRecord, Route, TurnRecord } from './logic'
-import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, TRAVEL_FRAMES, rasterCells, scenePixels } from './sprites'
-import type { Card, Scene } from './sprites'
+import type { Answer, Arm, Decision, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
+import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, STILL, rasterCells, scenePixels } from './sprites'
+import type { Card, Scene, SceneState } from './sprites'
 
 type $ = EngineInterface
-type GatewayView = PluginState['jev']['gateway']
 
 const PANE = 'jev'
-const EMPTY_SESSION: JevSessionView = { turns: 0, routed: 0, requests: 0, picked: 0, fallbacks: 0 }
+const EMPTY_SESSION: JevSessionView = { turns: 0, hintTurns: 0, controlTurns: 0, requests: 0, asked: 0, hinted: 0, followed: 0, output: 0, jevMs: [] }
+const status = atom({ plugin: 'jev', key: 'status' } as const, { state: 'off', mode: 'on' })
 const lastView = atom({ plugin: 'jev', key: 'last' } as const, null)
 const sessionView = atom({ plugin: 'jev', key: 'session' } as const, EMPTY_SESSION)
-const gateway = atom({ plugin: 'jev', key: 'gateway' } as const, { state: 'off', routed: false })
-const original = atom({ plugin: 'jev', key: 'original' } as const, { saved: false, value: null })
 const phase = atom({ plugin: 'jev', key: 'phase' } as const, null)
 const decision = atom({ plugin: 'jev', key: 'decision' } as const, null)
+const original = atom({ plugin: 'jev', key: 'original' } as const, { saved: false, value: null })
 
 const FRAME_MS = 180
-/** Frames the request spends with Jev (the packet's trip, then the owl at work) before Claude takes over. */
-const ASK_FRAMES = TRAVEL_FRAMES + 4
-/**
- * How long a health answer stands before the guard asks the gateway again: short, since a request
- * sent to a gateway that died since the last answer fails (a local check costs about a millisecond).
- */
-const HEALTH_TTL_MS = 1000
-/** How long the guard waits for /health before it calls the gateway down. */
-const HEALTH_TIMEOUT_MS = 800
-/** How often the watchdog looks at the gateway between requests. */
-const WATCH_MS = 5000
+/** How long a tool call waits for its response to end, to learn whether it is the response's last. */
+const STEP_WAIT_MS = 10_000
+/** jev-gateway's key file: the mod reads and writes the same one, so a key set in either works in both. */
+const KEY_FILE = '.jev-gateway/.env'
+const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529])
+
+/** One response of Claude's model, while its tool calls run. */
+type Step = {
+  /** Resolves with how many tools the response called once it is whole; -1 when it never was. */
+  done: Promise<number>
+  /** Tool calls of this response that have finished. */
+  finished: number
+  /** Their results as Claude reads them, before the conversation stores them. */
+  results: Record<string, string>
+}
 
 /** A turn of the main loop, from its start to its end. */
 type Turn = {
   prompt: string
+  arm: Arm | 'excluded' | 'off'
   steps: number
   tools: number
-  /** Requests sent through the gateway. */
-  routed: number
-  /** Requests sent direct because the gateway was not answering. */
-  fallbacks: number
-  gateway: GatewayTurn
+  jev: JevTurn
+  /** The tool Jev pointed at for the next request (hinted, or would have in shadow). */
+  pending?: string
+  step?: Step
 }
 
-/** What the gateway's /dashboard/events says about itself. */
-type Router = { routing?: boolean; minConfidence?: number; recorded?: number; startedAt?: string }
-type Health = { status?: string; pid?: number; upstream?: string; jev?: string }
-
 // The options, read at each load.
-let enabled = true
-let port = DEFAULT_PORT
+let mode: 'on' | 'shadow' | 'off' = 'on'
+let controlPercent = 20
 let excludedRepos = ''
 
 // The session's facts, worked out at session.start (which a reload fires again).
@@ -87,37 +94,19 @@ let home = ''
 let sessionId = ''
 let project = ''
 let logPath = ''
-let installDir = ''
 let excluded = false
-/** The mod runs this gateway (false: jev-claude started it, the mod only watches). */
-let managed = true
-/** The gateway's address, when there is one to route through or watch. */
-let origin: string | undefined
-/** ANTHROPIC_BASE_URL while routed, and while direct. */
-let routeUrl: string | undefined
-let directUrl: string | undefined
-let upstream = ANTHROPIC_UPSTREAM
-/** The guard routes this session: the gateway is set up (or external), not off, not excluded. */
-let wanted = false
-
-let health: { at: number; ok: boolean } | undefined
-let checking: Promise<boolean> | undefined
-let starting: Promise<void> | undefined
-let watchdog: { cancel: () => void } | undefined
+let access: JevAccess | undefined
 
 const turns = new Map<string, Turn>()
 let current: string | undefined
+/** What prompt.submit settled for the turn about to start: its arm, and Jev's first answer. */
+let opening: { arm: Turn['arm']; jev: JevTurn; pending?: string } | undefined
 let writing: Promise<void> = Promise.resolve()
-
-// The gateway's event log: the newest sequence number read, and the process it came from.
-let seq = 0
-let startedAt: string | undefined
-let polls: Promise<void> = Promise.resolve()
 
 // The animation: when the last tool call started (for the spark), the band's site, the timer.
 let lastToolAt = 0
 let bandSite: string | undefined
-/** The scene the band's line was last drawn for: the clock moves the scene on without a state change. */
+/** The scene the band's lines were last drawn for: the clock moves the scene on without a state change. */
 let drawnScene: Scene | undefined
 let ticker: { cancel: () => void } | undefined
 
@@ -125,359 +114,172 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function lastLine(text: string): string {
-  return text.trim().split('\n').filter(Boolean).pop()?.slice(0, 300) ?? ''
-}
-
 async function within<T>($: $, p: Promise<T>, ms: number): Promise<T | undefined> {
   return Promise.race([p, $.clock.sleep(ms).then(() => undefined, () => undefined)])
 }
 
-/** Changes some of the gateway's facts in state; the rest stay. */
-function setGateway($: $, patch: Partial<GatewayView>): Promise<unknown> {
-  return update($, gateway, g => ({ ...g, ...patch }))
+/** A number in [0, 1) for the control group's draw. */
+function roll(): number {
+  return crypto.getRandomValues(new Uint32Array(1))[0]! / 2 ** 32
 }
 
-// ------------------------------------------------------------ the installed gateway
+// ------------------------------------------------------------ the key and the session
 
-function packageDir(): string {
-  return `${installDir}/node_modules/jev-gateway`
-}
-
-async function isInstalled($: $): Promise<boolean> {
-  try {
-    const pkg = JSON.parse(await $.fs.read(`${packageDir()}/package.json`)) as { version?: string }
-    return pkg.version === GATEWAY_VERSION
-  } catch {
-    return false
-  }
-}
-
-async function nodeReady($: $): Promise<boolean> {
-  try {
-    const r = await $.process.run(['node', '--version'], { timeoutMs: 10_000 })
-    return r.exitCode === 0 && nodeVersionOk(r.stdout)
-  } catch {
-    return false
-  }
-}
-
-/** Installs the pinned gateway into the mod's own folder: nothing global changes. */
-async function npmInstall($: $): Promise<{ ok: boolean; error?: string }> {
-  const args = ['install', '--prefix', installDir, '--no-audit', '--no-fund', '--omit=dev', `jev-gateway@${GATEWAY_VERSION}`]
-  let error = 'npm was not found'
-  // Windows names it `npm.cmd`, which some runtimes start only through `cmd`.
-  for (const npm of [['npm'], ['npm.cmd'], ['cmd', '/c', 'npm']]) {
-    try {
-      const r = await $.process.run([...npm, ...args], { timeoutMs: 300_000 })
-      return r.exitCode === 0 ? { ok: true } : { ok: false, error: lastLine(r.stderr || r.stdout) || `npm exited ${r.exitCode}` }
-    } catch (e) {
-      error = message(e)
-    }
-  }
-  return { ok: false, error }
-}
-
-/** The provider whose key the gateway will find, in the environment or in its key file. */
-async function configuredKey($: $): Promise<GatewayProvider | undefined> {
+/** The key file and the environment, by jev-gateway's rule (the environment wins). */
+async function loadAccess($: $): Promise<JevAccess | undefined> {
   let file: Record<string, string> = {}
   try {
-    file = parseEnvFile(await $.fs.read(`${home}/.jev-gateway/.env`))
+    file = parseEnvFile(await $.fs.read(`${home}/${KEY_FILE}`))
   } catch {
     // no key file yet
   }
-  return keyProvider(file, {
+  return jevAccess(file, {
     JEV_PROVIDER: await $.env.get('JEV_PROVIDER'),
-    OPENROUTER_API_KEY: await $.env.get('OPENROUTER_API_KEY'),
+    JEV_MODEL: await $.env.get('JEV_MODEL'),
+    JEV_URL: await $.env.get('JEV_URL'),
+    TYPESAFE_BASE_URL: await $.env.get('TYPESAFE_BASE_URL'),
     TYPESAFE_API_KEY: await $.env.get('TYPESAFE_API_KEY'),
-    OPENCODE_API_KEY: await $.env.get('OPENCODE_API_KEY'),
+    OPENROUTER_API_KEY: await $.env.get('OPENROUTER_API_KEY'),
     AI_GATEWAY_API_KEY: await $.env.get('AI_GATEWAY_API_KEY'),
+    OPENCODE_API_KEY: await $.env.get('OPENCODE_API_KEY'),
   })
 }
 
 /**
- * Runs the gateway's own launcher (`jev-claude --start` or `--stop`): it detaches the gateway,
- * keeps its pid and log in ~/.jev-gateway, and reads the key from there, on every platform.
+ * Versions up to 0.4 sent the session through a gateway on port 8794. A session reloaded into this
+ * version may still point there: send it back where it went before, or the next request fails.
  */
-async function launch($: $, flag: '--start' | '--stop'): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const r = await $.process.run(['node', `${packageDir()}/bin/jev-claude.mjs`, flag], {
-      env: { JEV_CLAUDE_PORT: String(port), JEV_CLAUDE_UPSTREAM_BASE_URL: upstream },
-      timeoutMs: 20_000,
-    })
-    return r.exitCode === 0 ? { ok: true } : { ok: false, error: lastLine(r.stderr || r.stdout) || `the launcher exited ${r.exitCode}` }
-  } catch (e) {
-    return { ok: false, error: message(e) }
-  }
+async function undoGatewayRouting($: $): Promise<void> {
+  if (!isGatewayOn(await $.env.get('ANTHROPIC_BASE_URL'), OLD_GATEWAY_PORT)) return
+  const saved = await read($, original)
+  const before = saved.saved && !isGatewayOn(saved.value, OLD_GATEWAY_PORT) ? (saved.value ?? undefined) : undefined
+  await $.env.set('ANTHROPIC_BASE_URL', before)
 }
 
-async function fetchHealth($: $, at: string): Promise<Health | undefined> {
-  try {
-    const res = await within($, $.http.fetch(`${at}/health`), HEALTH_TIMEOUT_MS)
-    if (!res?.ok) return undefined
-    const body = JSON.parse(res.text) as Health
-    return body.status === 'ok' ? body : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** Starts the gateway unless it already answers; one start at a time. */
-function ensureStarted($: $): Promise<void> {
-  starting ??= startGateway($).finally(() => {
-    starting = undefined
-  })
-  return starting
-}
-
-async function startGateway($: $): Promise<void> {
-  if (!origin) return
-  await setGateway($, { state: 'starting', note: undefined })
-  const launched = await launch($, '--start')
-  const h = await fetchHealth($, origin)
-  health = { at: await $.clock.now(), ok: h !== undefined }
-  if (!h) {
-    await setGateway($, { state: 'down', note: launched.error ?? 'the gateway did not start' })
-    return
-  }
-  await setGateway($, { state: 'up', note: undefined, ...(h.pid ? { pid: h.pid } : {}) })
-  await readRouter($)
-}
-
-// ------------------------------------------------------------ routing the session
-
-/** Whether the gateway answers, asked at most every few seconds and one question at a time. */
-async function isHealthy($: $): Promise<boolean> {
-  const at = origin
-  if (!at) return false
-  const now = await $.clock.now()
-  if (health && now - health.at < HEALTH_TTL_MS) return health.ok
-  checking ??= fetchHealth($, at)
-    .then(async h => {
-      health = { at: await $.clock.now(), ok: h !== undefined }
-      return h !== undefined
-    })
-    .catch(() => false)
-    .finally(() => {
-      checking = undefined
-    })
-  return checking
-}
-
-/** Points this session's next model requests at the gateway, or back at the API. */
-async function route($: $, through: boolean): Promise<void> {
-  await $.env.set('ANTHROPIC_BASE_URL', through ? routeUrl : directUrl)
-  await setGateway($, { routed: through })
-}
-
-/**
- * Runs before every model request, subagents' included: routes it through the gateway when the
- * gateway answers, and straight to the API when it does not, before the request goes out.
- */
-async function guard($: $, turn: Turn | undefined): Promise<boolean> {
-  const g = await read($, gateway)
-  if (!wanted || g.paused) return false
-  if (await isHealthy($)) {
-    if (!g.routed || (g.state !== 'up' && g.state !== 'external')) {
-      await route($, true)
-      await setGateway($, { state: managed ? 'up' : 'external', note: undefined })
-    }
-    if (turn) turn.routed++
-    return true
-  }
-  if (turn) turn.fallbacks++
-  await fallBack($)
-  return false
-}
-
-/** The gateway stopped answering: requests go straight to the API until it is back. */
-async function fallBack($: $): Promise<void> {
-  const g = await read($, gateway)
-  // Always: the session may point at the gateway without the mod having put it there (a reload, a reinstall).
-  await route($, false)
-  // Already said, or a restart is under way and will say how it went.
-  if (g.state === 'down' || g.state === 'starting') return
-  await setGateway($, { state: 'down', note: managed ? 'not answering; it restarts on the next turn' : "jev-claude's gateway is not answering" })
-  $.ui.toast(`Jev: the gateway stopped answering, so requests go straight to the API.${managed ? ' It restarts on the next turn.' : ''}`)
-}
-
-/** Between requests too: a gateway that dies while the session is idle is let go of before the next one. */
-function watch($: $): void {
-  watchdog?.cancel()
-  watchdog = $.clock.every(WATCH_MS, async () => {
-    const g = await read($, gateway)
-    if (!wanted || !g.routed) return
-    if (!(await isHealthy($))) await fallBack($)
-  })
-}
-
-/**
- * Works out how this session is routed, from the options, the folder and the environment it
- * started with, and starts the gateway when the mod runs it.
- */
+/** Works out whether Jev can be asked here, from the options, the folder and the key. */
 async function configure($: $, cwd: string): Promise<void> {
-  let saved = await read($, original)
-  // A base URL at the mod's own gateway is one an earlier install left behind (a reinstall in
-  // the same session), not where the session really goes: its own default is the API.
-  if (!saved.saved || isOwnGateway(saved.value, port)) {
-    const value = (await $.env.get('ANTHROPIC_BASE_URL')) ?? null
-    saved = { saved: true, value: isOwnGateway(value, port) ? null : value }
-    const first = saved
-    await update($, original, () => first)
-  }
-  const value = saved.value ?? undefined
   excluded = isExcluded(cwd, excludedRepos)
-  const external = localGatewayOrigin(value)
-  managed = external === undefined
-  origin = external ?? `http://127.0.0.1:${port}`
-  routeUrl = external ? value : origin
-  // A session started through jev-claude has no API address of its own: direct is the default.
-  directUrl = external ? undefined : value
-  upstream = upstreamFor(external ? null : value)
-  wanted = false
-  health = undefined
-
-  const stay = async (state: 'off' | 'excluded' | 'not_installed' | 'no_key', note?: string, keep?: string) => {
-    await $.env.set('ANTHROPIC_BASE_URL', keep)
-    await update($, gateway, (g): GatewayView => ({ state, routed: false, ...(g.paused ? { paused: true } : {}), ...(note ? { note } : {}) }))
-  }
-  // Off: the session goes as it started (through jev-claude, if that is how it started).
-  if (!enabled) return stay('off', undefined, value)
-  // Excluded: never through a gateway, so the conversation never reaches Jev.
-  if (excluded) return stay('excluded', undefined, directUrl)
-  if (external) {
-    wanted = true
-    await setGateway($, { state: 'external', origin, note: undefined })
-    await readRouter($)
-    watch($)
-    return
-  }
-  if (!(await isInstalled($))) return stay('not_installed', 'run /jev-setup to install it', value)
-  if (!(await configuredKey($))) return stay('no_key', 'run /jev-setup to add a key for Jev', value)
-  wanted = true
-  // Start from direct whatever the session was left pointing at; the guard routes the next request.
-  await route($, false)
-  await setGateway($, { origin })
-  await ensureStarted($)
-  watch($)
+  access = mode === 'off' || excluded ? undefined : await loadAccess($)
+  const gateway = localGatewayOrigin(await $.env.get('ANTHROPIC_BASE_URL'))
+  const state: JevReadiness = mode === 'off' ? 'off' : excluded ? 'excluded' : access ? 'ready' : 'no_key'
+  await update($, status, before => ({
+    state,
+    mode,
+    ...(access ? { provider: PROVIDERS[access.provider].label } : {}),
+    ...(gateway ? { gateway } : {}),
+    ...(before.paused ? { paused: true } : {}),
+  }))
 }
 
-// ------------------------------------------------------------ the gateway's decisions
+/** Turns are followed (logged, counted) when Jev could be asked, and in excluded repos for the record. */
+function tracked(): boolean {
+  return mode !== 'off' && (excluded || access !== undefined)
+}
 
-async function readRouter($: $): Promise<void> {
-  if (!origin) return
-  try {
-    const res = await within($, $.http.fetch(`${origin}/dashboard/events?since=${Number.MAX_SAFE_INTEGER}`), 1500)
-    if (!res?.ok) return
-    const router = (JSON.parse(res.text) as { router?: Router }).router ?? {}
-    if (router.startedAt !== startedAt) seq = router.recorded ?? 0
-    startedAt = router.startedAt
-    await setGateway($, { routing: router.routing, minConfidence: router.minConfidence })
-  } catch {
-    // the guard finds out whether it answers
+/** How the next turn is run: excluded, paused (off), or drawn between hints and control (or shadow). */
+function armFor(paused: boolean): Turn['arm'] {
+  if (excluded) return 'excluded'
+  if (paused || !access) return 'off'
+  return pickArm(mode === 'shadow' ? 'shadow' : 'on', controlPercent, roll())
+}
+
+// ------------------------------------------------------------ asking Jev
+
+/** One call to Jev, retried once on a busy or failing server; throws with the status on a refusal. */
+async function askJev($: $, a: JevAccess, state: JevState, questions: Record<string, Question>): Promise<Record<string, Answer>> {
+  const init = {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${a.key}`,
+      'content-type': 'application/json',
+      // OpenRouter attributes traffic by these; the others ignore them.
+      'http-referer': 'https://github.com/ntkode/notkode-mods',
+      'x-title': 'jev for Claude Code',
+    },
+    body: JSON.stringify({ model: a.model, state, questions }),
+  }
+  for (let attempt = 0; ; attempt++) {
+    const res = await $.http.fetch(a.url, init)
+    if (res.ok) return normalizeAnswers((JSON.parse(res.text) as { answers?: unknown }).answers)
+    if (attempt > 0 || !RETRYABLE.has(res.status)) throw Object.assign(new Error(`HTTP ${res.status} from ${PROVIDERS[a.provider].label}`), { status: res.status })
+    await $.clock.sleep(100)
   }
 }
 
-/** Reads the gateway's newest requests into the running turn; serialized, so none is read twice or skipped. */
-function pollGateway($: $, turn: Turn | undefined): Promise<void> {
-  const at = origin
-  if (!at) return Promise.resolve()
-  polls = polls
-    .then(async () => {
-      const res = await within($, $.http.fetch(`${at}/dashboard/events?since=${seq}`), 1500)
-      if (!res?.ok) return
-      const body = JSON.parse(res.text) as { router?: Router; events?: GatewayEvent[] }
-      const router = body.router ?? {}
-      if ((router.startedAt && router.startedAt !== startedAt) || (router.recorded !== undefined && router.recorded < seq)) {
-        // The gateway restarted: it numbers requests again, after the history it replayed.
-        startedAt = router.startedAt
-        seq = router.recorded ?? 0
-        return
-      }
-      let newest: GatewayEvent | undefined
-      for (const event of body.events ?? []) {
-        seq = Math.max(seq, event.seq)
-        if (turn) tallyGateway(turn.gateway, event)
-        newest = event
-      }
-      await update($, gateway, g => ({ ...g, routing: router.routing ?? g.routing, minConfidence: router.minConfidence ?? g.minConfidence }))
-      if (newest && turn) {
-        const at = await $.clock.now()
-        const { mode, tool, reason } = newest
-        const confidence = newest.confidence ?? newest.jev?.confidence
-        await update($, decision, () => ({ mode, at, ...(tool ? { tool } : {}), ...(confidence !== undefined ? { confidence } : {}), ...(reason ? { reason } : {}) }))
-      }
-    })
-    .catch(() => undefined)
-  return polls
-}
-
-/** Switches Jev routing inside the gateway: off makes it a metering proxy, the baseline. */
-async function setRouting($: $, enabled: boolean): Promise<void> {
-  if (!origin) return
-  try {
-    const res = await $.http.fetch(`${origin}/dashboard/routing?enabled=${enabled}`, { method: 'POST' })
-    if (!res.ok) {
-      $.ui.toast(`Jev: the gateway did not switch routing (HTTP ${res.status})`)
-      return
-    }
-    const body = JSON.parse(res.text) as { routing?: boolean }
-    await setGateway($, { routing: body.routing ?? enabled })
-  } catch (e) {
-    $.ui.toast(`Jev: the gateway did not answer (${message(e)})`)
+/** What Jev makes of Claude's next request: the tools, the conversation, then jev-gateway's rule. */
+async function nextDecision($: $, rows: readonly MessageRow[], results: Readonly<Record<string, string>>): Promise<Decision> {
+  const a = access
+  if (!a) return { mode: 'pass', reason: 'jev_error: no key' }
+  const tools: Tool[] = (await $.tool.list()).map(t => ({ name: t.name, description: t.description }))
+  const conversation = turnsFrom(rows, results)
+  const skip = skipReason(tools, conversation)
+  if (skip) return { mode: 'pass', reason: skip }
+  const state = buildState(conversation)
+  let offered = tools
+  if (tools.length > MAX_TOOLS) {
+    const { questions, shards } = shortlistQuestions(tools)
+    offered = shortlisted(shards, await askJev($, a, state, questions))
+    if (offered.length === 0) return { mode: 'pass', reason: 'jev_unexpected_answer' }
   }
+  return decide(offered, await askJev($, a, state, toolQuestions(offered)))
 }
 
-/** Pauses or resumes routing for this session alone; the gateway keeps running. */
-async function setPaused($: $, paused: boolean): Promise<void> {
-  await setGateway($, { paused })
-  if (paused) await route($, false)
-  else if (wanted && (await isHealthy($))) await route($, true)
+/** The main conversation as Jev reads it. */
+async function conversationRows($: $): Promise<MessageRow[]> {
+  return (await $.session.messages()).map(m => ({
+    role: m.role,
+    text: m.text,
+    toolUses: m.toolUses.map(u => ({ tool_use_id: u.tool_use_id, tool: u.tool, input: u.input, ...(u.text !== undefined ? { text: u.text } : {}) })),
+  }))
 }
 
-async function restart($: $): Promise<void> {
-  if (!managed || !wanted) return
-  await launch($, '--stop')
-  health = undefined
-  await ensureStarted($)
-  const g = await read($, gateway)
-  if (g.state === 'up' && !g.paused) await route($, true)
-  $.ui.toast(g.state === 'up' ? 'Jev: gateway restarted.' : `Jev: the gateway did not start (${g.note ?? 'no answer'}).`)
+/**
+ * Asks Jev about Claude's next request while the band shows it, and counts the answer in `jev`.
+ * Never throws: Jev failing or running out of time is a pass, and the request goes on without a hint.
+ */
+async function consult($: $, jev: JevTurn, arm: JevArm, rows: readonly MessageRow[], results: Readonly<Record<string, string>> = {}): Promise<Decision> {
+  const started = await $.clock.now()
+  await update($, phase, () => ({ name: 'asking', at: started, arm }))
+  animate($)
+  const work = nextDecision($, rows, results).catch((error): Decision => ({ mode: 'pass', reason: `jev_error: ${message(error)}` }))
+  const d: Decision = (await within($, work, JEV_TIMEOUT_MS)) ?? { mode: 'pass', reason: 'jev_timeout' }
+  const at = await $.clock.now()
+  tally(jev, d, at - started)
+  await update($, decision, () => ({
+    mode: d.mode,
+    at,
+    ...(d.tool ? { tool: d.tool } : {}),
+    ...(d.confidence !== undefined ? { confidence: d.confidence } : {}),
+    ...(d.reason ? { reason: d.reason } : {}),
+    ...(arm === 'shadow' ? { shadow: true } : {}),
+  }))
+  return d
 }
 
 // ------------------------------------------------------------ the band above the prompt
 
-type SceneState = { scene: Scene; frame: number; spark: boolean; card: Card; asleep: boolean }
-
 /**
  * What the band shows now, from the mod's state and the clock: the same answer for a redraw and
- * for the animation. While a request is in flight (`asking`) the request travels to Jev, Jev
- * decides, then the reply streams back for as long as it takes; once it is done (`working`)
- * Claude acts on it. The gateway records a decision when its reply ends, so the card flies back
- * after the stream, not during it.
+ * for the animation. Jev's answer runs back to Claude as soon as it lands, then Claude's own
+ * phase (thinking, working) shows, with a hint it carries resting beside it.
  */
 async function sceneOf($: $): Promise<SceneState> {
-  const g = await read($, gateway)
-  const asleep = g.routing === false
-  const still = (scene: Scene): SceneState => ({ scene, frame: 0, spark: false, card: 'none', asleep })
-  if (g.state === 'down') return { ...still('error'), asleep: false }
-  if ((g.state !== 'up' && g.state !== 'external') || g.paused) return still('unset')
+  const s = await read($, status)
+  if (s.state !== 'ready') return { ...STILL, scene: 'unset' }
   const step = await read($, phase)
-  if (!step) return still('idle')
+  if (!step) return { ...STILL, scene: 'idle', asleep: s.paused === true }
   const now = await $.clock.now()
   const since = (at: number) => Math.max(0, Math.floor((now - at) / FRAME_MS))
+  const asleep = step.arm === 'control' || step.arm === 'off'
+  const shadow = step.arm === 'shadow'
   const d = await read($, decision)
-  const card: Card = d ? cardFor(d.mode) : 'none'
-  // The newest decision runs across to Claude first, then rests beside it.
-  if (d && since(d.at) < ANSWER_FRAMES) return { scene: 'answering', frame: since(d.at), spark: false, card, asleep }
-  const frame = since(step.at)
-  if (step.name === 'asking') {
-    // With routing off Jev is not asked: the request passes the sleeping owl straight on.
-    const decided = asleep ? TRAVEL_FRAMES : ASK_FRAMES
-    if (frame < decided) return { scene: 'asking', frame, spark: false, card: 'none', asleep }
-    return { scene: 'streaming', frame: frame - decided, spark: false, card: 'none', asleep }
-  }
-  return { scene: 'working', frame, spark: now - lastToolAt < 2 * FRAME_MS, card, asleep }
+  const card: Card = d ? cardFor(d) : 'none'
+  const answered = d !== null && d.at >= step.at
+  if (step.name === 'asking' && !answered) return { ...STILL, scene: 'asking', frame: since(step.at), asleep, shadow }
+  if (d && since(d.at) < ANSWER_FRAMES) return { ...STILL, scene: 'answering', frame: since(d.at), card, asleep, shadow }
+  // Answered and landed: Claude's request goes out next.
+  const scene: Scene = step.name === 'working' ? 'working' : 'thinking'
+  return { scene, frame: since(step.at), card, spark: now - lastToolAt < 2 * FRAME_MS, asleep, shadow }
 }
 
 /** Repaints the scene's cells a few times a second while the turn moves; no redraw. */
@@ -487,13 +289,13 @@ function animate($: $): void {
     if (!bandSite) return
     const now = await sceneOf($)
     if (now.scene !== drawnScene) {
-      // asking turned into streaming, a card landed: the line beside the scene changes too
+      // a card landed, Claude took over: the lines beside the scene change too
       drawnScene = now.scene
       $.ui.invalidate('ui.render')
       return
     }
     if (!ANIMATED.has(now.scene)) return
-    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark, now.asleep))
+    const art = rasterCells(scenePixels(now))
     await $.ui.blit({ requestId: bandSite, key: 'jev-scene', cells: art.cells }).catch(() => undefined)
   })
 }
@@ -504,57 +306,79 @@ function stopAnimation(): void {
 }
 
 /** Moves the turn to its next phase, which redraws the band and keeps the animation running. */
-async function enter($: $, name: 'asking' | 'working' | null): Promise<void> {
+async function enter($: $, name: 'thinking' | 'working' | null, arm: JevArm = 'hint', tool?: string): Promise<void> {
   const at = await $.clock.now()
-  await update($, phase, () => (name ? { name, at } : null))
+  await update($, phase, () => (name ? { name, at, arm, ...(tool ? { tool } : {}) } : null))
   if (name) animate($)
   else stopAnimation()
 }
 
+/** The standing setting, under the band's status line. */
+function routingText(s: { mode: string; paused?: boolean }, arm?: JevArm): string {
+  if (s.paused) return 'routing paused for this session'
+  if (s.mode === 'shadow') return 'routing in shadow · Claude sees no hints'
+  if (arm === 'control') return 'routing on · control turn, no hints'
+  return 'routing on'
+}
+
+/** Line 1 of the band, and the pane's "now": what is happening this moment. */
+function nowLine($: $, e: Parameters<$['ui']['resolve']>[0], scene: Scene, d: { mode: 'hint' | 'pass'; reason?: string; tool?: string; confidence?: number } | null, shadow: boolean, tool?: string, paused?: boolean): RenderElement {
+  const { Text } = $.ui.resolve(e)
+  switch (scene) {
+    case 'unset':
+      return <Text dimColor>Jev not set up · run /jev-setup</Text>
+    case 'idle':
+      return <Text dimColor>{paused ? 'Jev paused' : 'Jev idle'}</Text>
+    case 'asking':
+      return <Text color="yellow">Jev deciding…</Text>
+    case 'answering': {
+      if (!d) return <Text color="yellow">Jev deciding…</Text>
+      const card = cardFor(d)
+      return (
+        <Text color={card === 'pick' ? 'cyan' : card === 'fail' ? 'red' : undefined} dimColor={card === 'pass'}>
+          {decisionText(d, shadow)}
+        </Text>
+      )
+    }
+    case 'thinking':
+      return <Text>Claude thinking…</Text>
+    case 'working':
+      return <Text>Claude working{tool ? ` · ${tool}` : ''}</Text>
+  }
+}
+
 async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId?: string; props: { hasSurvey: boolean; maxRows: number } }, next: () => RenderElement | Promise<RenderElement>): Promise<RenderElement> {
-  const g = await read($, gateway)
-  if (e.props.hasSurvey || g.state === 'off' || g.state === 'excluded') return next()
+  const s = await read($, status)
+  if (e.props.hasSurvey || s.state === 'off' || s.state === 'excluded') return next()
   const now = await sceneOf($)
   drawnScene = now.scene
+  const step = await read($, phase)
   const d = await read($, decision)
   const { Box, Text } = $.ui.resolve(e)
+  const status1 = nowLine($, e, now.scene, d, now.shadow, step?.tool, s.paused)
+  const status2 = s.state === 'ready' ? routingText(s, step?.arm) : 'routing off · no key'
 
-  const decided = d ? decisionText(d) : undefined
-  const during = decided ? (
-    <Text color={cardFor(d!.mode) === 'pass' ? undefined : cardFor(d!.mode) === 'direct' ? 'green' : 'cyan'} dimColor={cardFor(d!.mode) === 'pass'}>{decided}</Text>
-  ) : (
-    <Text dimColor>Claude working</Text>
-  )
-  const unset =
-    g.state === 'starting' ? 'Jev starting the gateway…' : g.paused ? 'Jev paused · this session goes direct' : `Jev not set up · ${g.note ?? 'run /jev-setup'}`
-  const lines: Record<Scene, RenderElement> = {
-    unset: <Text dimColor>{unset}</Text>,
-    // At rest between turns; the routing switch is a standing setting, not something under way.
-    idle: <Text dimColor>Jev idle · {g.routing === false ? 'routing off (baseline)' : 'routing on'}</Text>,
-    asking: now.asleep ? <Text dimColor>routing off · passing it through</Text> : <Text color="yellow">Jev deciding…</Text>,
-    streaming: <Text color="yellow">Claude thinking…</Text>,
-    answering: during,
-    working: during,
-    error: <Text color="red">gateway down · direct</Text>,
-  }
-
-  // The scene, with an empty line above it to set it apart from the transcript.
+  // The scene, with an empty line above it to set it apart from the transcript; the setting under the status.
   if (e.surface === 'terminal' && e.props.maxRows >= SCENE_ROWS + 1) {
     const { Raster } = $.ui.resolve(e)
     bandSite = e.requestId
-    const art = rasterCells(scenePixels(now.scene, now.card, now.frame, now.spark, now.asleep))
+    const art = rasterCells(scenePixels(now))
     return (
       <Box flexDirection="row" marginTop={1}>
         <Raster key="jev-scene" columns={art.columns} rows={art.rows} cells={art.cells} />
-        <Box marginLeft={2}>{lines[now.scene]}</Box>
+        <Box marginLeft={2} flexDirection="column">
+          {status1}
+          <Text dimColor>{status2}</Text>
+        </Box>
       </Box>
     )
   }
 
   return (
     <Box>
-      <Text color={now.scene === 'error' ? 'red' : ANIMATED.has(now.scene) ? 'yellow' : 'cyan'}>◆ </Text>
-      {lines[now.scene]}
+      <Text color={ANIMATED.has(now.scene) ? 'yellow' : 'cyan'}>◆ </Text>
+      {status1}
+      <Text dimColor> · {status2}</Text>
     </Box>
   )
 }
@@ -607,19 +431,16 @@ type TurnEnd = {
 }
 
 async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<void> {
-  // The gateway records a request when its reply ends: give the last one a moment to land.
-  if (turn.routed > 0) await $.clock.sleep(300).then(() => pollGateway($, turn))
-  const routeTaken: Route = excluded ? 'excluded' : turn.routed > 0 ? 'gateway' : turn.fallbacks > 0 ? 'down' : 'direct'
   const record: TurnRecord = {
     type: 'turn',
-    v: 3,
+    v: 4,
     at: await $.clock.now(),
     session: sessionId,
     project,
     turnId,
     // An excluded repo's words stay out of the log too.
     prompt: excluded ? '' : turn.prompt.slice(0, 500),
-    route: routeTaken,
+    arm: turn.arm,
     actual: {
       steps: turn.steps,
       durationMs: e.durationMs,
@@ -629,8 +450,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
         ? { usage: { input: e.usage.input_tokens, output: e.usage.output_tokens, cacheRead: e.usage.cache_read_input_tokens, cacheWrite: e.usage.cache_creation_input_tokens } }
         : {}),
     },
-    ...(turn.gateway.requests > 0 ? { gateway: turn.gateway } : {}),
-    ...(turn.fallbacks > 0 ? { fallbacks: turn.fallbacks } : {}),
+    ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
   }
   await log($, record)
   await publish($, record)
@@ -638,39 +458,41 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
 
 /** Feeds the pane (the turn just logged, the session's totals) and returns the band to rest. */
 async function publish($: $, record: TurnRecord): Promise<void> {
-  const g = record.gateway
+  const j = record.jev
   const view: JevTurnView = {
     prompt: record.prompt.slice(0, 160),
-    route: record.route,
+    arm: record.arm,
     steps: record.actual.steps,
     durationMs: record.actual.durationMs,
     ...(record.actual.usage ? { output: record.actual.usage.output } : {}),
-    ...(record.fallbacks ? { fallbacks: record.fallbacks } : {}),
-    ...(g
+    ...(j
       ? {
-          gateway: {
-            requests: g.requests,
-            modes: g.modes,
-            reasons: g.reasons,
-            picks: g.picks.map(p => p.tool),
-            ...(g.jevMs.length > 0 ? { jevMs: median(g.jevMs) } : {}),
-            ...(g.cards?.length ? { cards: g.cards } : {}),
+          jev: {
+            asked: j.asked,
+            hinted: j.hinted,
+            followed: j.followed,
+            picks: j.picks.map(p => p.tool),
+            reasons: j.reasons,
+            ...(j.ms.length > 0 ? { ms: median(j.ms) } : {}),
+            cards: j.cards,
           },
         }
       : {}),
   }
-  const picked = g ? [...PICK_MODES].reduce((s, m) => s + (g.modes[m] ?? 0), 0) : 0
+  const hinting = record.arm === 'hint'
   await update($, lastView, () => view)
   await update($, sessionView, before => {
     const s = { ...EMPTY_SESSION, ...before }
     return {
       turns: s.turns + 1,
-      routed: s.routed + (record.route === 'gateway' ? 1 : 0),
-      requests: s.requests + (g?.requests ?? 0),
-      picked: s.picked + picked,
-      fallbacks: s.fallbacks + (record.fallbacks ?? 0),
-      output: (s.output ?? 0) + (record.route === 'gateway' ? (record.actual.usage?.output ?? 0) : 0),
-      jevMs: g?.jevMs.length ? [...(s.jevMs ?? []), median(g.jevMs)].slice(-100) : (s.jevMs ?? []),
+      hintTurns: s.hintTurns + (hinting ? 1 : 0),
+      controlTurns: s.controlTurns + (record.arm === 'control' ? 1 : 0),
+      requests: s.requests + record.actual.steps,
+      asked: s.asked + (j?.asked ?? 0),
+      hinted: s.hinted + (hinting ? (j?.hinted ?? 0) : 0),
+      followed: s.followed + (hinting ? (j?.followed ?? 0) : 0),
+      output: s.output + (record.actual.usage?.output ?? 0),
+      jevMs: j?.ms.length ? [...s.jevMs, median(j.ms)].slice(-100) : s.jevMs,
     }
   })
   await update($, decision, () => null)
@@ -681,44 +503,35 @@ async function publish($: $, record: TurnRecord): Promise<void> {
 
 const STATE_TEXT: Record<string, { text: string; color: string }> = {
   off: { text: 'off', color: 'gray' },
-  not_installed: { text: 'not installed', color: 'yellow' },
   no_key: { text: 'needs a key', color: 'yellow' },
-  starting: { text: 'starting', color: 'yellow' },
-  up: { text: 'running', color: 'green' },
-  down: { text: 'down', color: 'red' },
+  ready: { text: 'ready', color: 'green' },
   excluded: { text: 'off in this repo', color: 'gray' },
-  external: { text: "jev-claude's gateway", color: 'green' },
 }
 
-/** One cell per request: who decided it. */
+/** One cell per time Jev was asked: what it answered. */
 const CARD_CELL: Record<string, { cell: string; color?: string; dim?: boolean }> = {
   pick: { cell: '■', color: 'cyan' },
-  direct: { cell: '■', color: 'green' },
   pass: { cell: '·', dim: true },
+  fail: { cell: '×', color: 'red' },
 }
 
-const ROUTE_TEXT: Record<JevTurnView['route'], string> = {
-  gateway: 'through the gateway',
-  direct: 'direct',
-  down: 'direct · gateway was down',
-  excluded: 'excluded repo · direct',
-}
-
-function host(url: string | undefined): string {
-  return (url ?? '').replace(/^https?:\/\//, '').replace(/\/v1$/, '')
+const ARM_TEXT: Record<JevTurnView['arm'], string | undefined> = {
+  hint: undefined,
+  control: 'control turn: Jev sat it out, to compare with',
+  shadow: 'shadow: Jev was asked, Claude saw none of it',
+  excluded: 'excluded repo: Jev was not asked',
+  off: 'paused: Jev was not asked',
 }
 
 async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   const { Box, Text, Button } = $.ui.resolve(e)
-  const g = await read($, gateway)
+  const s = await read($, status)
   const last = await read($, lastView)
   const step = await read($, phase)
   const d = await read($, decision)
   const session = { ...EMPTY_SESSION, ...(await read($, sessionView)) }
-  const state = STATE_TEXT[g.state] ?? { text: g.state, color: 'gray' }
-  const reachable = g.state === 'up' || g.state === 'external'
-  const setUp = g.state === 'not_installed' || g.state === 'no_key'
-  const routing = g.routing !== false
+  const state = STATE_TEXT[s.state] ?? { text: s.state, color: 'gray' }
+  const ready = s.state === 'ready'
   const pct = (n: number, of: number) => (of > 0 ? ` (${Math.round((n / of) * 100)}%)` : '')
   const label = (text: string) => <Text dimColor>{text.padEnd(16)}</Text>
   const tile = (value: string, name: string, color?: string) => (
@@ -727,11 +540,9 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       <Text dimColor>{name}</Text>
     </Box>
   )
-
-  const lg = last?.gateway
-  const cards = lg?.cards ?? []
-  const steered = lg ? [...PICK_MODES].reduce((n, m) => n + (lg.modes[m] ?? 0), 0) : 0
-  const sessionJev = session.jevMs?.length ? median(session.jevMs) : undefined
+  const now = await sceneOf($)
+  const lj = last?.jev
+  const sessionJev = session.jevMs.length ? median(session.jevMs) : undefined
 
   return (
     <Box flexDirection="column">
@@ -740,20 +551,18 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         <Text>
           <Text bold>Jev</Text>
           <Text color={state.color}>  ● {state.text}</Text>
-          {reachable ? <Text color={routing ? 'cyan' : 'yellow'}>  {routing ? 'routing on' : 'routing off · baseline'}</Text> : null}
+          {ready ? <Text color={s.paused ? 'yellow' : 'cyan'}>  {routingText(s)}</Text> : null}
         </Text>
-        <Text dimColor>{managed ? `gateway ${GATEWAY_VERSION}` : ''}</Text>
+        <Text dimColor>{s.provider ?? ''}</Text>
       </Box>
-      {g.note ? <Text color={g.state === 'down' ? 'red' : 'yellow'} wrap="wrap">{g.note}</Text> : null}
-      {origin && reachable ? (
+      {ready ? (
         <Text dimColor wrap="truncate-end">
-          {host(origin)} → {host(upstream)} · acts at ≥ {g.minConfidence ?? 0.7}
+          asked before each of Claude's requests · hints at ≥ 0.7 · {controlPercent}% control turns
         </Text>
       ) : null}
-      {wanted ? (
-        <Text wrap="truncate-end">
-          <Text dimColor>this session  </Text>
-          <Text color={g.paused ? 'yellow' : g.routed ? 'green' : 'red'}>{g.paused ? 'paused · goes direct' : g.routed ? 'through the gateway' : 'direct'}</Text>
+      {s.gateway ? (
+        <Text color="yellow" wrap="wrap">
+          This session's requests go through a local proxy ({s.gateway}). If it is jev-gateway, it hints too: run one or the other to measure either.
         </Text>
       ) : null}
 
@@ -762,7 +571,7 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         <Box marginTop={1}>
           <Text wrap="truncate-end">
             <Text color="yellow">▶ now  </Text>
-            {d ? <Text color={cardFor(d.mode) === 'pass' ? undefined : 'cyan'} dimColor={cardFor(d.mode) === 'pass'}>{decisionText(d)}</Text> : <Text dimColor>{step.name === 'asking' ? 'Jev deciding…' : 'Claude working'}</Text>}
+            {nowLine($, e, now.scene, d, now.shadow, step.tool, s.paused)}
           </Text>
         </Box>
       ) : null}
@@ -774,57 +583,60 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
           {last ? (
             <Text dimColor>
               {'  '}
-              {duration(last.durationMs)} · {lg?.requests ?? last.steps} requests{last.output !== undefined ? ` · ${tokens(last.output)} out` : ''}
+              {duration(last.durationMs)} · {last.steps} requests{last.output !== undefined ? ` · ${tokens(last.output)} out` : ''}
             </Text>
           ) : null}
         </Text>
         {last === null ? (
-          <Text dimColor>No turn yet. Send a prompt and Jev's decisions show up here.</Text>
+          <Text dimColor>No turn yet. Send a prompt and Jev's answers show up here.</Text>
         ) : (
           <Box flexDirection="column">
             {last.prompt ? <Text dimColor italic wrap="truncate-end">“{cleanPrompt(last.prompt)}”</Text> : null}
-            {last.route !== 'gateway' || last.fallbacks ? (
-              <Text color={last.route === 'down' || last.fallbacks ? 'red' : undefined} dimColor={last.route !== 'down' && !last.fallbacks}>
-                {ROUTE_TEXT[last.route]}{last.fallbacks ? ` · ${last.fallbacks} request(s) went direct` : ''}
-              </Text>
-            ) : null}
-            {lg ? (
+            {ARM_TEXT[last.arm] ? <Text dimColor>{ARM_TEXT[last.arm]}</Text> : null}
+            {lj ? (
               <Box flexDirection="column" marginTop={1}>
-                {cards.length > 0 ? (
+                {lj.cards.length > 0 ? (
                   <Text wrap="wrap">
-                    {cards.map(c => {
+                    {lj.cards.map(c => {
                       const cell = CARD_CELL[c] ?? CARD_CELL.pass!
                       return <Text color={cell.color} dimColor={cell.dim}>{cell.cell}</Text>
                     })}
                   </Text>
                 ) : null}
                 <Text>
-                  {label('Jev steered')}
-                  <Text color="cyan" bold>{steered}</Text>
-                  <Text dimColor> of {lg.requests}{pct(steered, lg.requests)}</Text>
+                  {label(last.arm === 'shadow' ? 'Jev would hint' : 'Jev hinted')}
+                  <Text color="cyan" bold>{lj.hinted}</Text>
+                  <Text dimColor> of {lj.asked} asks{pct(lj.hinted, lj.asked)}</Text>
                 </Text>
-                {lg.picks.length > 0 ? (
-                  <Text wrap="wrap">
-                    {label('picked')}
-                    <Text color="cyan">{toolCounts(lg.picks)}</Text>
+                {lj.hinted > 0 ? (
+                  <Text>
+                    {label(last.arm === 'shadow' ? 'Claude did too' : 'Claude followed')}
+                    <Text bold>{lj.followed}</Text>
+                    <Text dimColor> of {lj.hinted}</Text>
                   </Text>
                 ) : null}
-                {Object.keys(lg.reasons).length > 0 ? (
+                {lj.picks.length > 0 ? (
+                  <Text wrap="wrap">
+                    {label('picked')}
+                    <Text color="cyan">{toolCounts(lj.picks)}</Text>
+                  </Text>
+                ) : null}
+                {Object.keys(lj.reasons).length > 0 ? (
                   <Text wrap="wrap">
                     {label('left to Claude')}
                     <Text>
-                      {Object.entries(lg.reasons)
+                      {Object.entries(lj.reasons)
                         .sort((a, b) => b[1] - a[1])
                         .map(([r, n]) => `${reasonText(r)} ${n}`)
                         .join(' · ')}
                     </Text>
                   </Text>
                 ) : null}
-                {lg.jevMs !== undefined ? (
+                {lj.ms !== undefined ? (
                   <Text>
                     {label('Jev latency')}
-                    <Text color={lg.jevMs > 1000 ? 'yellow' : undefined}>{latency(lg.jevMs)}</Text>
-                    <Text dimColor> per request, before Claude starts</Text>
+                    <Text color={lj.ms > 1000 ? 'yellow' : undefined}>{latency(lj.ms)}</Text>
+                    <Text dimColor> per ask, before Claude's request</Text>
                   </Text>
                 ) : null}
               </Box>
@@ -839,35 +651,38 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         <Box flexDirection="row" flexWrap="wrap">
           {tile(String(session.turns), 'turns')}
           {tile(String(session.requests), 'requests')}
-          {tile(`${session.picked}${pct(session.picked, session.requests)}`, 'Jev steered', 'cyan')}
+          {tile(`${session.hinted}${pct(session.hinted, session.asked)}`, 'hinted', 'cyan')}
+          {session.hinted > 0 ? tile(`${session.followed}${pct(session.followed, session.hinted)}`, 'followed') : null}
+          {session.controlTurns > 0 ? tile(String(session.controlTurns), 'control turns') : null}
           {session.output ? tile(tokens(session.output), 'output') : null}
           {sessionJev !== undefined ? tile(latency(sessionJev), 'Jev p50', sessionJev > 1000 ? 'yellow' : undefined) : null}
-          {session.fallbacks > 0 ? tile(String(session.fallbacks), 'went direct', 'red') : null}
         </Box>
       </Box>
 
       <Box marginTop={1}>
         <Text dimColor wrap="wrap">
-          {last === null
-            ? "Jev picks the tool that fits each request; the gateway passes it to Claude as a hint (with thinking on, it can't force one). To see if it helps, switch Jev routing off for similar work, then /jev-report."
-            : routing
-              ? 'Measure it: switch Jev routing off for some similar work, then /jev-report compares the two.'
-              : 'Baseline: Jev is not asked. Switch routing back on to compare in /jev-report.'}
+          {s.mode === 'shadow'
+            ? 'Shadow: Jev is asked and its picks are recorded, but Claude never sees them. /jev-report shows how often Claude chose the same tool on its own.'
+            : last === null
+              ? "Jev picks the tool that fits Claude's next step, and Claude gets it as a hint it may ignore. Some turns run without Jev (control), so /jev-report can tell whether hints help on your own work."
+              : '/jev-report puts turns with hints next to control turns: same kind of work, with and without Jev.'}
         </Text>
       </Box>
 
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
-        {setUp ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
-        {wanted ? <Button key="route" hotkey="p" plain label={g.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !g.paused)} /> : null}
-        {reachable ? <Button key="routing" hotkey="g" plain label={routing ? 'routing off' : 'routing on'} onPress={() => setRouting($, !routing)} /> : null}
-        {wanted && managed ? <Button key="restart" hotkey="x" plain label="restart" onPress={() => restart($)} /> : null}
-        {reachable ? <Button key="dashboard" hotkey="d" plain label="copy dashboard" onPress={press => void $.ui.copy({ text: `${origin}/dashboard`, surface: press.surface })} /> : null}
+        {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
+        {ready ? <Button key="pause" hotkey="p" plain label={s.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !s.paused)} /> : null}
         <Button key="report" hotkey="r" plain label="report" onPress={() => void $.command.run({ command: 'jev-report', args: '' })} />
         {/* the terminal's pane has its own ✕ */}
         {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
     </Box>
   )
+}
+
+/** Stops or resumes asking Jev in this session alone. */
+async function setPaused($: $, paused: boolean): Promise<void> {
+  await update($, status, s => ({ ...s, paused }))
 }
 
 // ------------------------------------------------------------ setup
@@ -900,95 +715,93 @@ async function readClipboard($: $): Promise<{ text: string; clear: string[] } | 
   return undefined
 }
 
-type Saved = { ok: boolean; ms?: number; reason?: string; refused?: boolean; freeUnavailable?: boolean }
+type Checked = { ok: boolean; ms?: number; status?: number; reason?: string }
 
-/** Checks the key with one call to Jev and saves it to the gateway's key file, through the gateway's own code. */
-async function saveKey($: $, provider: GatewayProvider, key: string, paid: boolean): Promise<Saved> {
-  try {
-    const r = await $.process.run(['node', `${$.plugin.root}/scripts/save-key.mjs`], {
-      stdin: JSON.stringify({ root: packageDir(), provider, key, paid }),
-      timeoutMs: 30_000,
-    })
-    try {
-      return JSON.parse(lastLine(r.stdout)) as Saved
-    } catch {
-      return { ok: false, reason: lastLine(r.stderr) || `exit ${r.exitCode}` }
-    }
-  } catch (e) {
-    return { ok: false, reason: message(e) }
-  }
+/** One small call to Jev with the key: it answers, or says why not. */
+async function checkKey($: $, a: JevAccess): Promise<Checked> {
+  const started = await $.clock.now()
+  const state: JevState = { conversation: [{ role: 'user', text: 'What is in the README?' }] }
+  const call = askJev($, a, state, toolQuestions([{ name: 'Read', description: 'Reads a file from the local filesystem.' }])).then(
+    (): Checked => ({ ok: true }),
+    (error): Checked => ({ ok: false, reason: message(error), ...((error as { status?: number }).status ? { status: (error as { status: number }).status } : {}) }),
+  )
+  const r = (await within($, call, 15_000)) ?? { ok: false, reason: 'no answer in 15s' }
+  return r.ok ? { ok: true, ms: (await $.clock.now()) - started } : r
 }
 
-/** Asks for a key for Jev and saves it; undefined when the person stopped. */
+/** Writes the key to jev-gateway's key file, keeping the rest of it, readable only by the user. */
+async function saveKey($: $, provider: Provider, key: string, model?: string): Promise<void> {
+  const path = `${home}/${KEY_FILE}`
+  let text = ''
+  try {
+    text = await $.fs.read(path)
+  } catch {
+    // a new file
+  }
+  await $.fs.write(path, upsertEnv(text, { JEV_PROVIDER: provider, [PROVIDERS[provider].keyEnv]: key, ...(model ? { JEV_MODEL: model } : {}) }))
+  // No chmod on Windows: the file sits in the user's own profile there.
+  await $.process.run(['chmod', '600', path], { timeoutMs: 5000 }).catch(() => undefined)
+}
+
+/** Asks for a key for Jev, checks it, and saves it. */
 async function setUpKey($: $): Promise<{ text: string; ok: boolean }> {
-  const ids = Object.keys(GATEWAY_PROVIDERS) as GatewayProvider[]
-  const chosen = await ask($, 'Where should the gateway reach Jev?', ids.map(id => GATEWAY_PROVIDERS[id].label), 'Jev')
-  const id = ids.find(p => GATEWAY_PROVIDERS[p].label === chosen)
+  const ids = Object.keys(PROVIDERS) as Provider[]
+  const chosen = await ask($, 'Where should the mod reach Jev?', ids.map(id => PROVIDERS[id].label))
+  const id = ids.find(p => PROVIDERS[p].label === chosen)
   if (!id) return { ok: false, text: 'Jev setup cancelled.' }
-  const p = GATEWAY_PROVIDERS[id]
+  const p = PROVIDERS[id]
   const how = await ask(
     $,
-    `Copy your ${p.label} API key (get one at ${p.keyUrl}), then choose "Read the clipboard". It is read once, checked with one call to Jev, saved to ~/.jev-gateway/.env (readable only by you, shared with every jev-* launcher), never shown, and the clipboard is cleared.`,
+    `Copy your ${p.label} API key (get one at ${p.keyUrl}), then choose "Read the clipboard". It is read once, checked with one call to Jev, saved to ~/${KEY_FILE} (readable only by you; jev-gateway reads the same file), never shown, and the clipboard is cleared.`,
     ['Read the clipboard', 'Cancel'],
     'API key',
   )
   if (how !== 'Read the clipboard') return { ok: false, text: 'Jev setup cancelled.' }
   const clip = await readClipboard($)
-  if (!clip) return { ok: false, text: `Jev setup stopped: no clipboard tool found. Run this in a terminal instead: node "${packageDir()}/bin/jev-claude.mjs" --setup` }
+  if (!clip) return { ok: false, text: `Jev setup stopped: no clipboard tool found. Put the key in ~/${KEY_FILE} as ${p.keyEnv}=<key> instead, then run /jev-setup again.` }
   if (!isValidKey(clip.text)) return { ok: false, text: 'Jev setup stopped: the clipboard does not hold an API key (one line of letters, digits, dots, dashes or underscores). Copy the key and run /jev-setup again.' }
 
-  let saved = await saveKey($, id, clip.text, false)
-  if (!saved.ok && saved.freeUnavailable) {
-    const paid = await ask($, `The free Jev model is unavailable on ${p.label}. Use the paid one? Its key check may be billed.`, ['Use the paid model', 'Cancel'], 'Jev')
+  const accessWith = (model?: string) => jevAccess({ JEV_PROVIDER: id, [p.keyEnv]: clip.text, ...(model ? { JEV_MODEL: model } : {}) }, {})!
+  let model: string | undefined
+  let checked = await checkKey($, accessWith())
+  if (!checked.ok && id === 'opencode' && (checked.status === 404 || checked.status === 410)) {
+    const paid = await ask($, `The free Jev model is unavailable on ${p.label}. Use the paid one? Its key check may be billed.`, ['Use the paid model', 'Cancel'])
     if (paid !== 'Use the paid model') return { ok: false, text: 'Jev setup stopped: the free model is unavailable. Nothing was saved.' }
-    saved = await saveKey($, id, clip.text, true)
+    model = PROVIDERS.opencode.paidModel
+    checked = await checkKey($, accessWith(model))
   }
-  if (!saved.ok) {
-    return { ok: false, text: `Jev setup stopped: ${saved.refused ? `${p.label} refused that key` : 'the key check failed'} (${saved.reason ?? 'no answer'}). Nothing was saved.` }
+  if (!checked.ok) {
+    const refused = checked.status === 401 || checked.status === 403
+    return { ok: false, text: `Jev setup stopped: ${refused ? `${p.label} refused that key` : 'the key check failed'} (${checked.reason ?? 'no answer'}). Nothing was saved.` }
   }
+  await saveKey($, id, clip.text, model)
   await $.process.run(clip.clear, { stdin: '', timeoutMs: 5000 }).catch(() => undefined)
-  return { ok: true, text: `Key checked (Jev answered in ${saved.ms ?? '?'}ms) and saved to ~/.jev-gateway/.env; clipboard cleared.` }
+  return { ok: true, text: `Key checked (Jev answered in ${checked.ms ?? '?'}ms) and saved to ~/${KEY_FILE}; clipboard cleared.` }
 }
 
 async function setup($: $, cwd: string): Promise<string> {
-  if (!enabled) return 'Jev is off: turn on "Jev: route through jev-gateway" in /config first.'
-  if (excluded) return 'This repo is in the excluded list (/config, "Jev: excluded repos"), so nothing here goes through the gateway.'
-  if (!managed) return `This session runs through ${origin}, a gateway jev-claude started; the mod watches it and has nothing to set up.`
-  if (!(await nodeReady($))) return 'Jev setup stopped: jev-gateway needs Node.js 22.15 or newer on your PATH (check with `node --version`).'
+  if (mode === 'off') return 'Jev is off: set "Jev: hints" to on or shadow in /config first.'
+  if (excluded) return 'This repo is in the excluded list (/config, "Jev: excluded repos"), so Jev is never asked here.'
   const lines: string[] = []
-
-  if (!(await isInstalled($))) {
-    const yes = await ask($, `Install jev-gateway ${GATEWAY_VERSION} now? The mod runs npm install jev-gateway@${GATEWAY_VERSION} into ${installDir}; nothing global changes.`, ['Install', 'Cancel'])
-    if (yes !== 'Install') return 'Jev setup cancelled: nothing was installed.'
-    const installed = await npmInstall($)
-    if (!installed.ok || !(await isInstalled($))) return `Jev setup stopped: npm install failed (${installed.error ?? 'the package is not where it should be'}).`
-    lines.push(`Installed jev-gateway ${GATEWAY_VERSION} into ${installDir}.`)
-  }
-
-  const provider = await configuredKey($)
-  const keep = provider ? await ask($, `A key for Jev is already set up (${GATEWAY_PROVIDERS[provider].label}). Keep it?`, ['Keep it', 'Set a new key']) : 'Set a new key'
-  if (keep === undefined) return [...lines, 'Jev setup cancelled.'].join('\n')
+  const existing = await loadAccess($)
+  const keep = existing ? await ask($, `A key for Jev is already set up (${PROVIDERS[existing.provider].label}). Keep it?`, ['Keep it', 'Set a new key']) : 'Set a new key'
+  if (keep === undefined) return 'Jev setup cancelled.'
   if (keep === 'Set a new key') {
     const key = await setUpKey($)
     lines.push(key.text)
     if (!key.ok) return lines.join('\n')
-    // A gateway that is already running read the old key when it started.
-    if (origin && (await fetchHealth($, origin))) await launch($, '--stop')
   }
-
   await configure($, cwd)
-  const g = await read($, gateway)
-  if (g.state !== 'up') return [...lines, `The gateway did not start: ${g.note ?? 'no answer'}. Try /jev-setup again, or the restart button in /jev.`].join('\n')
-  if (!g.paused) await route($, true)
-  lines.push(`jev-gateway is running on ${origin} → ${upstream}; this session's requests go through it from the next one. /jev shows its decisions.`)
+  if (!access) return [...lines, `Jev setup stopped: no key found in ~/${KEY_FILE} or the environment.`].join('\n')
+  lines.push(`Jev is ready (${PROVIDERS[access.provider].label}): it is asked before Claude's requests from the next one. /jev shows its answers.`)
   return lines.join('\n')
 }
 
 // ------------------------------------------------------------ hooks
 
 export const register: Register = (on, options) => {
-  enabled = options.gateway !== 'off'
-  port = typeof options.port === 'number' && Number.isInteger(options.port) && options.port > 0 && options.port < 65536 ? options.port : DEFAULT_PORT
+  mode = options.mode === 'off' || options.mode === 'shadow' ? options.mode : 'on'
+  controlPercent = typeof options.controlPercent === 'number' && options.controlPercent >= 0 && options.controlPercent <= 100 ? options.controlPercent : 20
   excludedRepos = typeof options.excludedRepos === 'string' ? options.excludedRepos : ''
   let cwd = ''
 
@@ -1000,20 +813,22 @@ export const register: Register = (on, options) => {
     sessionId = await $.session.id()
     const day = new Date(await $.clock.now()).toISOString().slice(0, 10)
     logPath = home ? `${home}/.claude/jev-mod/log/${day}-${sessionId}.jsonl` : ''
-    installDir = `${home}/.claude/jev-mod/gateway/${GATEWAY_VERSION}`
 
-    // A load or reload starts with no turn in flight: clear what a cut-short one left behind,
-    // and a last-turn view an older version of the mod left in another shape.
+    // A load or reload starts with no turn in flight: clear what a cut-short one left behind, and
+    // views an older version of the mod left in another shape.
     await update($, phase, () => null)
     await update($, decision, () => null)
     const last = (await read($, lastView)) as Record<string, unknown> | null
-    if (last && !('route' in last)) await update($, lastView, () => null)
+    if (last && !('arm' in last)) await update($, lastView, () => null)
+    const totals = (await read($, sessionView)) as Record<string, unknown>
+    if (!('hintTurns' in totals)) await update($, sessionView, () => EMPTY_SESSION)
 
-    await $.command.register({ name: 'jev', description: 'Open the Jev pane: jev-gateway, its decisions on the last turn, and the switches' })
-    await $.command.register({ name: 'jev-setup', description: 'Install jev-gateway, add a key for Jev, and start routing this session through it' })
-    await $.command.register({ name: 'jev-report', description: "What jev-gateway decided, and routing on vs off (the baseline)", argumentHint: '[days]' })
+    await $.command.register({ name: 'jev', description: 'Open the Jev pane: what Jev answered on the last turn, and the switches' })
+    await $.command.register({ name: 'jev-setup', description: "Add a key for Jev, so it is asked before Claude's requests" })
+    await $.command.register({ name: 'jev-report', description: 'What Jev answered, and turns with hints vs control turns', argumentHint: '[days]' })
 
     try {
+      await undoGatewayRouting($)
       await configure($, cwd)
     } catch (error) {
       $.ui.log(`jev: ${message(error)}`, { to: 'debug' })
@@ -1023,45 +838,76 @@ export const register: Register = (on, options) => {
 
   // ------------------------------------------------------------ during a turn
 
+  // Before Claude's first request: Jev reads the conversation and the new prompt; a hint rides the prompt.
+  on('prompt.submit', async ($, e, next) => {
+    // A prompt delivered into a running turn is not a new turn's.
+    if (e.turnId || !tracked()) return next(e)
+    const arm = armFor((await read($, status)).paused === true)
+    const o: NonNullable<typeof opening> = { arm, jev: emptyJevTurn() }
+    opening = o
+    if ((arm !== 'hint' && arm !== 'shadow') || e.text.trimStart().startsWith('/')) return next(e)
+    const rows: MessageRow[] = [...(await conversationRows($)), { role: 'user', text: e.text, toolUses: [] }]
+    const d = await consult($, o.jev, arm, rows)
+    if (d.mode !== 'hint' || !d.tool) return next(e)
+    o.pending = d.tool
+    return arm === 'hint' ? next({ ...e, context: [...(e.context ?? []), hintText(d.tool)] }) : next(e)
+  })
+
   on('turn.start', async ($, e, next) => {
-    turns.set(e.turnId, { prompt: e.text, steps: 0, tools: 0, routed: 0, fallbacks: 0, gateway: emptyGatewayTurn() })
-    current = e.turnId
-    await update($, decision, () => null)
-    // A gateway that went down gets one restart per turn; requests go direct until it answers.
-    if (wanted && managed && (await read($, gateway)).state === 'down') void ensureStarted($).catch(() => undefined)
+    if (tracked()) {
+      const o = opening ?? { arm: armFor((await read($, status)).paused === true), jev: emptyJevTurn() }
+      opening = undefined
+      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}) })
+      current = e.turnId
+    }
     return next(e)
   })
 
+  // Each of Claude's requests: Claude thinks while Jev holds still.
   on('turn.step', async function* ($, e, next) {
     const turn = e.agentId ? undefined : turns.get(e.turnId)
-    if (turn) turn.steps++
-    const routed = await guard($, turn)
-    if (turn && routed) await enter($, 'asking')
-    const result = yield* next(e)
-    if (turn && routed) {
-      // The reply is in: Claude acts on it while the decision flies back.
-      await enter($, 'working')
-      void pollGateway($, turn)
-      void $.clock
-        .sleep(400)
-        .then(() => pollGateway($, turn))
-        .catch(() => undefined)
+    if (!turn) return yield* next(e)
+    turn.steps++
+    let settle: (calls: number) => void = () => undefined
+    const step: Step = { done: new Promise<number>(r => (settle = r)), finished: 0, results: {} }
+    turn.step = step
+    if (turn.arm !== 'excluded') await enter($, 'thinking', turn.arm)
+    let calls = -1
+    try {
+      const result = yield* next(e)
+      calls = result.toolUses.length
+      // Did Claude call the tool Jev pointed at (hinted, or would have in shadow)?
+      if (turn.pending && result.toolUses.some(u => u.name === turn.pending)) turn.jev.followed++
+      turn.pending = undefined
+      return result
+    } finally {
+      settle(calls)
     }
-    return result
   })
 
-  on('tool.call', ($, e, next) => {
+  // Claude's tools: Claude works; after the last call of a response, Jev is asked about the next request.
+  on('tool.call', async ($, e, next) => {
     const turn = !e.agentId && current ? turns.get(current) : undefined
-    if (turn) {
-      turn.tools++
-      void $.clock
-        .now()
-        .then(t => {
-          lastToolAt = t
-        })
-        .catch(() => undefined)
-    }
-    return next(e)
+    if (!turn) return next(e)
+    // Every call carries both; the generated MCP typings leave one member of the union without them.
+    const call = e as unknown as { tool: string; tool_use_id: string }
+    turn.tools++
+    lastToolAt = await $.clock.now()
+    if (turn.arm !== 'excluded') await enter($, 'working', turn.arm, call.tool)
+    const result = await next(e)
+    const step = turn.step
+    if (!step || result.deny !== undefined) return result
+    const mine = ++step.finished
+    if (result.text !== undefined) step.results[call.tool_use_id] = result.text
+    const calls = (await within($, step.done, STEP_WAIT_MS)) ?? mine
+    // The response's other calls are still running, or it never ended: not this one's to ask.
+    if (calls < 0 || mine < calls || turn.step !== step) return result
+    turn.step = undefined
+    if (turn.arm !== 'hint' && turn.arm !== 'shadow') return result
+    const d = await consult($, turn.jev, turn.arm, await conversationRows($), step.results)
+    if (d.mode !== 'hint' || !d.tool) return result
+    turn.pending = d.tool
+    return turn.arm === 'hint' ? { ...result, context: [...(result.context ?? []), hintText(d.tool)] } : result
   })
 
   on('turn.complete', ($, e, next) => {
@@ -1069,7 +915,7 @@ export const register: Register = (on, options) => {
     const turn = turns.get(e.turnId)
     turns.delete(e.turnId)
     if (current === e.turnId) current = undefined
-    if (turn && enabled) void finish($, e.turnId, turn, e).catch(error => $.ui.log(`jev: ${message(error)}`, { to: 'debug' }))
+    if (turn) void finish($, e.turnId, turn, e).catch(error => $.ui.log(`jev: ${message(error)}`, { to: 'debug' }))
     else void enter($, null).catch(() => undefined)
     return next(e)
   })
