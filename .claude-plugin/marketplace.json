@@ -12,6 +12,13 @@
       "source": "./jev/plugins/jev",
       "category": "productivity",
       "keywords": ["jev", "typesafe", "tool-routing", "mod"]
+    },
+    {
+      "name": "files",
+      "description": "A file browser pane inside Claude Code: walk the project, read Markdown rendered, see pictures in the terminal, and the files Claude touched this session",
+      "source": "./files/plugins/files",
+      "category": "productivity",
+      "keywords": ["files", "file-browser", "markdown", "images", "mod"]
     }
   ]
 }

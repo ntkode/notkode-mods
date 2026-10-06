@@ -14,6 +14,7 @@ Update the list with `/plugin marketplace update notkode-mods`.
 | Plugin | What it does | Source |
 |---|---|---|
 | `jev` | Jev, TypeSafe's fast decision model, picks the tool that fits Claude's next step, and Claude gets it as a hint. Shown live above the prompt, measured against a control group of turns without Jev. After installing, run `/jev-setup`. | [`jev/`](jev/) |
+| `files` | A file browser pane: walk the project, read Markdown rendered, see pictures in the terminal, and the files Claude touched this session. Open it with `/files`. | [`files/`](files/) |
 
 ## Adding a plugin
 

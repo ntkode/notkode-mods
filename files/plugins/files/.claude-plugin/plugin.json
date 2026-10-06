@@ -1,0 +1,19 @@
+{
+  "name": "files",
+  "version": "0.2.0",
+  "description": "A file browser pane inside Claude Code: walk the project, read Markdown rendered, code highlighted, and pictures drawn in the terminal; see the files Claude touched this session.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Matheus Tonelotto"
+  },
+  "homepage": "https://github.com/ntkode/notkode-mods/tree/main/files",
+  "repository": "https://github.com/ntkode/notkode-mods",
+  "license": "MIT",
+  "keywords": [
+    "files",
+    "file-browser",
+    "markdown",
+    "images",
+    "mod"
+  ]
+}
