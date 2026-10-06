@@ -12,7 +12,7 @@ decisions, what has been proven, the current code state and the next steps.
   - `.claude-plugin/plugin.json`: manifest and `userConfig` (the `/config` rows)
   - `hooks/register.tsx`: the hooks module (`register(on, options)`)
   - `hooks/logic.ts`: pure code, no `$`, tested directly: Jev's questions and decision rule (ported from jev-gateway), the key file, the log, the report
-  - `hooks/sprites.ts`: the band's pixel scenes, pure. Rule: only the actor doing the work moves (the owl only while Jev decides, Claude while it thinks or runs tools), and information shows as a particle only while it travels
+  - `hooks/sprites.ts`: the band's pixel scenes, pure. Rule: only the actor doing the work moves (the owl only while Jev decides, Claude while it thinks or runs tools), and information shows as a particle only while it travels; they stand on grass, and what each one says sits in a speech balloon the band draws beside it
   - `types/index.d.ts`: the `$.state` contract
   - `tests/*.test.ts`: run with `claude plugin test`
   - `experiments/`: new use cases, each off by default (create when the first one lands)

@@ -244,10 +244,10 @@ async function band($: Engine, surface: 'terminal' | 'desktop' = 'terminal') {
   return $.ui.mount({ plugin: 'jev', surface, component: 'AbovePrompt', requestId: 'band', props: BAND_PROPS })
 }
 
-/** The band's two lines: what is happening, and the setting under it. */
+/** The band's two balloons: what Claude says, then what Jev says (their tails left out). */
 async function lines($: Engine) {
   const b = await band($)
-  const texts = (await b.findAll({ type: 'Text' })).map(t => t.text)
+  const texts = (await b.findAll({ type: 'Text' })).map(t => t.text).filter(t => t !== '◂' && t !== '▸')
   await b.unmount()
   return texts
 }
@@ -256,15 +256,15 @@ test('asks Jev before the first request and after the tools; each hint rides the
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
-  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
+  expect(await lines($)).toEqual(['ready when you are', 'idle'])
 
   const sent = await submit($, 'why does the test fail?')
   expect(sent).toMatchObject({ context: [hintText('Read')] })
   expect(w.asks).toHaveLength(1)
   expect(w.asks[0]!.auth).toBe(`Bearer ${KEY}`)
   expect(w.asks[0]!.state.conversation.at(-1)).toEqual({ role: 'user', text: 'why does the test fail?' })
-  // the answer runs back to Claude, said under the status line's setting
-  expect(await lines($)).toEqual(['Jev hinted Read 0.90', 'routing on'])
+  // the answer runs back to Claude, said in Jev's balloon
+  expect(await lines($)).toEqual(['…', 'hinted Read 0.90'])
 
   await $.turn.start({ text: 'why does the test fail?', turnId: 'turn-1' })
   w.responses.push([{ name: 'Read', input: { file_path: 'x.ts' } }])
@@ -292,7 +292,7 @@ test('asks Jev before the first request and after the tools; each hint rides the
     // Claude called Read after the first hint, not Bash after the second
     jev: { asked: 2, hinted: 2, followed: 1, cards: ['pick', 'pick'] },
   })
-  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
+  expect(await lines($)).toEqual(['ready when you are', 'idle'])
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
   expect(await pane.find({ text: /1 hints in 1 turns|measuring: 1\/5 with, 0\/5 control/ })).toBeDefined()
@@ -324,10 +324,10 @@ test('the band follows the turn: Jev deciding, its card landing, then Claude thi
   w.jev.push({ ...answer('Read'), hold: new Promise<void>(r => (release = r)) })
   const sent = submit($, 'what changed?')
   await settle(() => w.asks.length === 1)
-  expect(await lines($)).toEqual(['Jev deciding…', 'routing on'])
+  expect(await lines($)).toEqual(['Jev, what next?', 'hmm… deciding'])
   release()
   await sent
-  expect(await lines($)).toEqual(['Jev hinted Read 0.90', 'routing on'])
+  expect(await lines($)).toEqual(['…', 'hinted Read 0.90'])
 
   await $.turn.start({ text: 'what changed?', turnId: 'turn-1' })
   w.messages = () => [{ role: 'user', text: 'what changed?', toolUses: [] }]
@@ -335,13 +335,13 @@ test('the band follows the turn: Jev deciding, its card landing, then Claude thi
   await step($, 'turn-1', 0)
   // once the card has crossed, Claude's request shows
   await clock.advance(7 * 180)
-  expect(await lines($)).toEqual(['Claude thinking…', 'routing on'])
+  expect(await lines($)).toEqual(['thinking…', 'hinted Read 0.90'])
 
   let done = () => {}
   w.toolHold = new Promise<void>(r => (done = r))
   const call = $.tool.call({ tool: 'Read', file_path: 'x.ts' })
   await settle(() => w.toolUseIds.length === 1)
-  expect(await lines($)).toEqual(['Claude working · Read', 'routing on'])
+  expect(await lines($)).toEqual(['running Read', 'hinted Read 0.90'])
   done()
   await call
   expect(w.asks).toHaveLength(2)
@@ -358,7 +358,7 @@ test('Jev too slow: the prompt goes on without a hint after the time budget, and
   await clock.advance(4_000)
   const result = await sent
   expect('context' in result ? result.context : undefined).toBeUndefined()
-  expect(await lines($)).toEqual(['Jev left it to Claude · Jev too slow', 'routing on'])
+  expect(await lines($)).toEqual(['…', 'left it to Claude · Jev too slow'])
   release()
 })
 
@@ -388,7 +388,7 @@ test('a control turn: Jev sits it out, the owl sleeps, and the band says why', {
   await $.turn.start({ text: 'hello', turnId: 'turn-1' })
   w.responses.push([{ name: 'Bash', input: { command: 'ls' } }])
   await step($, 'turn-1', 0)
-  expect(await lines($)).toEqual(['Claude thinking…', 'routing on · control turn, no hints'])
+  expect(await lines($)).toEqual(['thinking…', 'zzz · control turn'])
   const bash = await $.tool.call({ tool: 'Bash', command: 'ls' })
   expect('context' in bash ? bash.context : undefined).toBeUndefined()
   await step($, 'turn-1', 1)
@@ -431,9 +431,9 @@ test('no key: the band says what to do, on every surface, and nothing is asked',
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock, { key: false })
   await start($)
-  expect(await lines($)).toEqual(['Jev not set up · run /jev-setup', 'routing off · no key'])
+  expect(await lines($)).toEqual(['no Jev yet', 'not set up · run /jev-setup'])
   const desktop = await band($, 'desktop')
-  expect(await desktop.find({ text: /Jev not set up/ })).toBeDefined()
+  expect(await desktop.find({ text: /not set up · run \/jev-setup/ })).toBeDefined()
   await desktop.unmount()
   await submit($, 'hello')
   expect(w.asks).toHaveLength(0)
@@ -452,7 +452,7 @@ test('/jev-setup checks the key with one call, saves it without it reaching argv
   expect(w.runs.some(argv => argv.join(' ').includes(KEY))).toBe(false)
   expect(w.runs).toContainEqual(['chmod', '600', KEY_FILE])
   expect(w.runs.some(argv => argv[0] === 'pbcopy')).toBe(true)
-  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
+  expect(await lines($)).toEqual(['ready when you are', 'idle'])
 })
 
 test('/jev-setup switching provider drops the old provider\'s model name', HINTS, async ($, on) => {
@@ -601,7 +601,7 @@ test('a reload (no session.start) sets the session up on first use: the key is r
   const sent = await plainTurn($, w, 'why does the test fail?')
   expect(sent).toMatchObject({ context: [hintText('Read')] })
   expect(logged(w)[0]).toMatchObject({ arm: 'hint', project: 'demo-app' })
-  expect(await lines($)).toEqual(['Jev idle', 'routing on'])
+  expect(await lines($)).toEqual(['ready when you are', 'idle'])
 })
 
 test('effort: a quick status question runs at low effort on the same model, and goes back to your effort once it grows', HINTS, async ($, on) => {

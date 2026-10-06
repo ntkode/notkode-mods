@@ -1,8 +1,9 @@
 // Pixel scenes for the band above the prompt: Claude (the orange pixel mascot, on the left: it
-// starts every exchange) and Jev (a teal owl, the judge, on the right). Only the one doing the work
-// moves, and information shows as a particle exactly while it travels: the conversation going to
-// Jev, Jev's answer coming back. 4 pixels tall, two per terminal cell, so the scene is 2 rows.
-// Pure: tests run it as is.
+// starts every exchange) and Jev (a teal owl, the judge, on the right), standing on a strip of grass.
+// Only the one doing the work moves, and information shows as a particle exactly while it travels:
+// the conversation going to Jev, Jev's answer coming back. What each one says sits in a speech
+// balloon beside it, drawn by the band. 6 pixels tall (4 for the actors, 2 of ground), two per
+// terminal cell, so the scene is 3 rows. Pure: tests run it as is.
 
 /** One scene pixel: an RGB color, or null for the terminal's own background. */
 type Px = number | null
@@ -21,11 +22,14 @@ export const COLORS = {
   claude: 0xd97757,
   claudeDim: 0x8a6a5e,
   claudeEye: 0x1a1a1a,
-  trail: 0x6c7680,
+  /** The ground they stand on, and the blades and the flower between them. */
+  grass: 0x4c9a4a,
+  grassLight: 0x7bc96f,
+  soil: 0x2f6b34,
+  blade: 0x6cbf5f,
+  flower: 0xf6e27a,
   /** The conversation on its way to Jev. */
   packet: 0xe6edf3,
-  /** Claude writing its next request: dots beside its head. */
-  thought: 0xf4a582,
   spark: 0xffd166,
   /** Card colors: what Jev answered. */
   pick: 0x4cc9f0,
@@ -40,8 +44,8 @@ export const COLORS = {
  * - `answering`: Jev's answer runs back to Claude as a card: cyan for a hint, grey when Jev left
  *   the choice to Claude, red when Jev failed. In shadow the card stays with Jev: Claude never
  *   sees it.
- * - `thinking`: Claude's request is with its model: Claude glances and blinks, dots appear beside
- *   its head, a hint it carries rests by it. Jev holds still.
+ * - `thinking`: Claude's request is with its model: Claude glances and blinks, a hint it carries
+ *   rests by it. Jev holds still.
  * - `working`: Claude runs tools: its legs step, a spark flashes per call (still lit as the next
  *   request starts, when the call was too quick to see). Jev holds still.
  */
@@ -72,9 +76,10 @@ export const TRAVEL_FRAMES = 4
 /** Frames the card takes to cross from Jev to Claude. */
 export const ANSWER_FRAMES = 7
 
-const MID = 8
+const MID = 14
 const BLANK = '.'.repeat(MID)
-const TRAIL = '..g..g..'
+/** The grass between them, on the actors' bottom row: blades and one flower. Still: only actors move. */
+const TUFTS = '.v..f...v.v..v'
 
 function put(row: string, at: number, text: string): string {
   return row.slice(0, at) + text + row.slice(at + text.length)
@@ -115,43 +120,44 @@ function resting(s: SceneState): number | undefined {
 
 function middle(s: SceneState): string[] {
   const f = s.frame
-  switch (s.scene) {
-    case 'unset':
-      return [BLANK, BLANK, BLANK, BLANK]
-    case 'idle':
-      return [BLANK, BLANK, TRAIL, BLANK]
-    case 'asking': {
-      if (f < TRAVEL_FRAMES) {
-        // the conversation runs from Claude (left) to Jev (right)
-        const at = Math.min(MID - 2, f * 2)
-        return [BLANK, BLANK, put(BLANK, at, 'pp'), BLANK]
+  const rows = ((): string[] => {
+    switch (s.scene) {
+      case 'unset':
+      case 'idle':
+        return [BLANK, BLANK, BLANK]
+      case 'asking': {
+        // the conversation runs from Claude (left) to Jev (right); then Jev decides, in its eyes
+        if (f >= TRAVEL_FRAMES) return [BLANK, BLANK, BLANK]
+        const at = Math.min(MID - 2, Math.round((f * (MID - 2)) / (TRAVEL_FRAMES - 1)))
+        return [BLANK, BLANK, put(BLANK, at, 'pp')]
       }
-      // Jev works: a pulse of dots next to it
-      const dots = f % 3 === 0 ? '.......g' : f % 3 === 1 ? '.....g.g' : '...g.g.g'
-      return [BLANK, BLANK, dots, BLANK]
+      case 'answering': {
+        // the card runs from Jev (right) to Claude (left); in shadow it never leaves Jev
+        const at = s.shadow ? MID - 2 : Math.round(((MID - 2) * (ANSWER_FRAMES - 1 - Math.min(f, ANSWER_FRAMES - 1))) / (ANSWER_FRAMES - 1))
+        const card = put(BLANK, at, 'cc')
+        return [BLANK, card, card]
+      }
+      case 'thinking':
+      case 'working': {
+        // a tool's spark sits by Claude, and outlasts a call too quick to see by a frame or two
+        const top = s.spark ? put(BLANK, 0, 'y') : BLANK
+        const at = resting(s)
+        if (at === undefined) return [top, BLANK, BLANK]
+        return [top, put(BLANK, at, 'cc'), put(BLANK, at, 'cc')]
+      }
     }
-    case 'answering': {
-      // the card runs from Jev (right) to Claude (left); in shadow it never leaves Jev
-      const at = s.shadow ? MID - 2 : MID - 2 - Math.min(f, ANSWER_FRAMES - 1)
-      const card = put(BLANK, at, 'cc')
-      return [BLANK, card, card, BLANK]
-    }
-    case 'thinking':
-    case 'working': {
-      // Claude's own activity sits by Claude: the dots of a request being written, and a tool's
-      // spark, which outlasts a call too quick to see by a frame or two
-      const dots = s.scene === 'thinking' ? (['t.......', 't.t.....', 't.t.t...', BLANK] as const)[f % 4]! : BLANK
-      const top = s.spark ? put(dots, 0, 'y') : dots
-      const at = resting(s)
-      if (at === undefined) return [top, BLANK, TRAIL, BLANK]
-      return [top, put(BLANK, at, 'cc'), put(TRAIL, at, 'cc'), BLANK]
-    }
-  }
+  })()
+  return [...rows, TUFTS]
 }
 
-export const SCENE_ROWS = 2
+export const SCENE_ROWS = 3
 
-/** The scene's pixels: Claude, what passes between them, Jev. */
+/** One column of ground: grass with a lighter blade here and there, soil under it. */
+function ground(c: number): [number, number] {
+  return [(c * 5) % 7 < 2 ? COLORS.grassLight : COLORS.grass, COLORS.soil]
+}
+
+/** The scene's pixels: Claude, what passes between them, Jev, all on the grass. */
 export function scenePixels(s: SceneState): Px[][] {
   const dim = s.scene === 'unset'
   const failed = s.scene === 'answering' && s.card === 'fail'
@@ -163,9 +169,9 @@ export function scenePixels(s: SceneState): Px[][] {
     k: failed ? COLORS.error : COLORS.pupil,
   }
   const between: Record<string, number | undefined> = {
-    g: COLORS.trail,
     p: COLORS.packet,
-    t: COLORS.thought,
+    v: COLORS.blade,
+    f: COLORS.flower,
     c: s.card === 'none' ? undefined : COLORS[s.card],
     y: COLORS.spark,
   }
@@ -183,6 +189,9 @@ export function scenePixels(s: SceneState): Px[][] {
     for (const ch of j[r]!) row.push(palette[ch] ?? null)
     rows.push(row)
   }
+  const width = rows[0]!.length
+  rows.push(Array.from({ length: width }, (_, c) => ground(c)[0]))
+  rows.push(Array.from({ length: width }, (_, c) => ground(c)[1]))
   return rows
 }
 
