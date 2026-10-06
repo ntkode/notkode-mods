@@ -26,6 +26,11 @@ import {
   decide,
   doneText,
   doneVerdict,
+  newTrail,
+  noteCall,
+  verifyNeed,
+  verifyNudge,
+  verifyRole,
   decisionText,
   dollars,
   columnChart,
@@ -57,7 +62,7 @@ import {
   turnsFrom,
   upsertEnv,
 } from './logic'
-import type { Answer, Arm, Decision, DoneCheck, Spend, Triage, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
+import type { Answer, Arm, Decision, DoneCheck, Spend, VerifyCheck, VerifyTrail, Triage, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
 import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, STILL, rasterCells, scenePixels } from './sprites'
 import type { Card, Scene, SceneState } from './sprites'
 
@@ -107,6 +112,10 @@ type Turn = {
   before?: Usage
   /** The done check at the turn's last stop, while it runs and once it is in. */
   done?: Promise<DoneCheck | undefined>
+  /** The files Claude changed this turn and what it ran or looked at after. */
+  trail: VerifyTrail
+  /** Set once the turn was sent back to check its changes: once per turn. */
+  verifyPushed?: VerifyCheck['need']
   /** What Jev made of the prompt (effort, topic) and what the mod did with it. */
   triage?: NonNullable<TurnRecord['triage']>
 }
@@ -128,6 +137,7 @@ async function usageNow($: $): Promise<Usage> {
 let mode: 'on' | 'shadow' | 'off' = 'on'
 let controlPercent = 20
 let doneMode: 'shadow' | 'on' | 'off' = 'off'
+let verifyMode: 'on' | 'off' = 'on'
 let effortMode: 'on' | 'shadow' | 'off' = 'on'
 let skillMode: 'on' | 'shadow' | 'off' = 'on'
 let topicMode: 'ask' | 'off' = 'ask'
@@ -249,9 +259,9 @@ async function undoGatewayRouting($: $): Promise<void> {
 }
 
 /** The features' switches as the status records them. */
-function switchStatus(): { doneCheck: 'on' | 'off'; effort: 'on' | 'off'; skillGate: 'on' | 'off'; freshStart: 'on' | 'off' } {
+function switchStatus(): { doneCheck: 'on' | 'off'; verify: 'on' | 'off'; effort: 'on' | 'off'; skillGate: 'on' | 'off'; freshStart: 'on' | 'off' } {
   const v = (on: boolean) => (on ? 'on' : 'off') as 'on' | 'off'
-  return { doneCheck: v(doneMode === 'on'), effort: v(effortMode !== 'off'), skillGate: v(skillMode !== 'off'), freshStart: v(topicMode !== 'off') }
+  return { doneCheck: v(doneMode === 'on'), verify: v(verifyMode === 'on'), effort: v(effortMode !== 'off'), skillGate: v(skillMode !== 'off'), freshStart: v(topicMode !== 'off') }
 }
 
 /** Works out whether Jev can be asked here, from the options, the folder and the key. */
@@ -734,6 +744,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
     },
     ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
     ...(done ? { done } : {}),
+    ...(turn.trail.changed.length > 0 ? { verify: { ...(turn.verifyPushed ? { need: turn.verifyPushed } : {}), pushed: turn.verifyPushed !== undefined, files: turn.trail.changed.length } } : {}),
     ...(turn.triage ? { triage: turn.triage } : {}),
     ...(skillsSaved > 0 || freshDropped > 0 ? { saved: { ...(skillsSaved > 0 ? { skills: skillsSaved } : {}), ...(freshDropped > 0 ? { fresh: freshDropped } : {}) } } : {}),
   }
@@ -809,11 +820,12 @@ const SWITCHES = {
   skillGate: { config: 'skillGate', label: 'skill gate', hotkey: 'k' },
   freshStart: { config: 'freshStart', label: 'fresh start', hotkey: 't' },
   doneCheck: { config: 'doneCheck', label: 'done check', hotkey: 'd' },
+  verify: { config: 'verify', label: 'verify', hotkey: 'v' },
 } as const
 type SwitchKey = keyof typeof SWITCHES
 
 function isOn(key: SwitchKey): boolean {
-  return { hints: mode !== 'off', effort: effortMode !== 'off', skillGate: skillMode !== 'off', freshStart: topicMode !== 'off', doneCheck: doneMode === 'on' }[key]
+  return { hints: mode !== 'off', effort: effortMode !== 'off', skillGate: skillMode !== 'off', freshStart: topicMode !== 'off', doneCheck: doneMode === 'on', verify: verifyMode === 'on' }[key]
 }
 
 function setSwitch(key: SwitchKey, on: boolean): void {
@@ -821,6 +833,7 @@ function setSwitch(key: SwitchKey, on: boolean): void {
   else if (key === 'effort') effortMode = on ? 'on' : 'off'
   else if (key === 'skillGate') skillMode = on ? 'on' : 'off'
   else if (key === 'freshStart') topicMode = on ? 'ask' : 'off'
+  else if (key === 'verify') verifyMode = on ? 'on' : 'off'
   else doneMode = on ? 'on' : 'off'
 }
 
@@ -957,9 +970,9 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         <Box marginTop={1} flexDirection="column">
           <Text>
             <Text bold>By day</Text>
-            <Text dimColor>  share of the weekly quota saved each day; the done check, stops checked</Text>
+            <Text dimColor>  share of the weekly quota saved each day; done check and verify, how often they acted</Text>
           </Text>
-          {keys.map(key => featureChart($, e, SWITCHES[key].label, b.features[key], b.dayStarts, key === 'doneCheck' ? 'count' : 'pct'))}
+          {keys.map(key => featureChart($, e, SWITCHES[key].label, b.features[key], b.dayStarts, key === 'doneCheck' || key === 'verify' ? 'count' : 'pct'))}
         </Box>
       ) : null}
 
@@ -1099,6 +1112,7 @@ export const register: Register = (on, options) => {
   // Every feature is a plain on/off; values from older versions (shadow) count as their nearest.
   mode = options.mode === 'off' ? 'off' : 'on'
   doneMode = options.doneCheck === 'on' ? 'on' : 'off'
+  verifyMode = options.verify === 'off' ? 'off' : 'on'
   effortMode = options.effort === 'off' ? 'off' : 'on'
   skillMode = options.skillGate === 'off' ? 'off' : 'on'
   topicMode = options.freshStart === 'off' ? 'off' : 'ask'
@@ -1178,7 +1192,7 @@ export const register: Register = (on, options) => {
     if (tracked()) {
       const o = opening ?? { arm: armFor((await read($, status)).paused === true), jev: emptyJevTurn() }
       opening = undefined
-      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}), ...(o.triage ? { triage: o.triage } : {}), before: await usageNow($) })
+      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, trail: newTrail(), ...(o.pending ? { pending: o.pending } : {}), ...(o.triage ? { triage: o.triage } : {}), before: await usageNow($) })
       current = e.turnId
     }
     return next(e)
@@ -1222,6 +1236,8 @@ export const register: Register = (on, options) => {
     lastToolAt = await $.clock.now()
     if (turn.arm !== 'excluded') await enter($, 'working', turn.arm, call.tool)
     const result = await next(e)
+    // What the call did for verification: a change, a run, a look (a refused call did nothing).
+    if (result.deny === undefined) noteCall(turn.trail, verifyRole(call.tool, e as unknown as Record<string, unknown>))
     const step = turn.step
     if (!step || result.deny !== undefined) return result
     const mine = ++step.finished
@@ -1237,19 +1253,32 @@ export const register: Register = (on, options) => {
     return turn.arm === 'hint' ? { ...result, context: [...(result.context ?? []), hintText(d.tool)] } : result
   })
 
-  // Claude's stop: a promise of more work with nothing running sends it back to work (or, in shadow, is recorded).
+  // Claude's stop: a promise of more work with nothing running sends it back to work; then changes
+  // nothing ran or looked at send it back once to check them.
   on('classic.Stop', async ($, e, next) => {
     const result = await next(e)
     await ensureSession($)
     const turn = current ? turns.get(current) : undefined
-    // The main loop only, Jev's turns only, and never a stop that a push already caused.
-    if (doneMode === 'off' || e.agent_id || e.stop_hook_active || !turn || turn.arm === 'excluded' || result.block) return result
-    const done = checkStop($, e)
-    turn.done = done
-    const d = await done
-    if (!d.pushed) return result
-    $.ui.toast('Jev: Claude stopped on a promise with nothing running, so it was sent back to work.')
-    return { ...result, block: DONE_NUDGE }
+    // The main loop only, Jev's turns only, and never a stop another hook already refused.
+    if (e.agent_id || !turn || turn.arm === 'excluded' || result.block) return result
+    // The done check: never on a stop that a push already caused.
+    if (doneMode !== 'off' && !e.stop_hook_active) {
+      const done = checkStop($, e)
+      turn.done = done
+      const d = await done
+      if (d.pushed) {
+        $.ui.toast('Jev: Claude stopped on a promise with nothing running, so it was sent back to work.')
+        return { ...result, block: DONE_NUDGE }
+      }
+    }
+    // Verify: once per turn, not while work runs on, nor when Claude ends on a question to the person.
+    if (verifyMode === 'off' || turn.verifyPushed) return result
+    const need = verifyNeed(turn.trail)
+    const pending = (e.background_tasks ?? []).some(t => t.status === 'running' || t.status === 'pending')
+    if (!need || pending || (e.last_assistant_message ?? '').trim().endsWith('?')) return result
+    turn.verifyPushed = need
+    $.ui.toast(need === 'look' ? 'Jev: Claude changed a screen without looking at it, so it was sent back to check.' : 'Jev: Claude changed files and nothing ran since, so it was sent back to check.')
+    return { ...result, block: verifyNudge(need, turn.trail) }
   })
 
   on('turn.complete', ($, e, next) => {

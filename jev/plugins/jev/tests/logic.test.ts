@@ -8,6 +8,10 @@ import {
   TOOL_KEY,
   buildState,
   board,
+  newTrail,
+  noteCall,
+  verifyNeed,
+  verifyRole,
   cardFor,
   columnChart,
   cleanPrompt,
@@ -329,5 +333,35 @@ describe('the board by day', () => {
     expect(b.features.doneCheck.daily).toEqual([0, 0, 0, 0, 1, 0, 2])
     // no quota recorded yet: nothing can be said of the savings
     expect(b.features.hints.daily.every(v => v === undefined)).toBe(true)
+  })
+})
+
+describe('verify', () => {
+  test('what a call does: a change (a screen or not), a run, a look, or nothing', () => {
+    expect(verifyRole('Edit', { file_path: '/p/src/App.tsx' })).toEqual({ change: '/p/src/App.tsx', screen: true })
+    expect(verifyRole('Write', { file_path: '/p/api.py' })).toEqual({ change: '/p/api.py', screen: false })
+    for (const command of ['npm test', 'pnpm run build', 'npx tsc --noEmit', 'cd app && pytest -q', 'cargo test', 'curl -s localhost:3000/health', 'claude plugin test .', 'go test ./...']) expect(verifyRole('Bash', { command })).toBe('run')
+    for (const command of ['ls', 'git status', 'cat README.md', 'git diff']) expect(verifyRole('Bash', { command })).toBeUndefined()
+    expect(verifyRole('Bash', { command: 'screencapture -x /tmp/s.png' })).toBe('look')
+    expect(verifyRole('Read', { file_path: '/tmp/s.png' })).toBe('look')
+    expect(verifyRole('Read', { file_path: '/p/a.ts' })).toBeUndefined()
+    expect(verifyRole('mcp__claude-in-chrome__computer', {})).toBe('look')
+    expect(verifyRole('mcp__playwright__browser_take_screenshot', {})).toBe('look')
+  })
+
+  test('a screen needs a look after its last change; code a run or a look', () => {
+    const t = newTrail()
+    expect(verifyNeed(t)).toBeUndefined()
+    noteCall(t, verifyRole('Edit', { file_path: '/p/a.ts' }))
+    expect(verifyNeed(t)).toBe('run')
+    noteCall(t, 'run')
+    expect(verifyNeed(t)).toBeUndefined()
+    noteCall(t, verifyRole('Edit', { file_path: '/p/Page.vue' }))
+    noteCall(t, 'run')
+    expect(verifyNeed(t)).toBe('look')
+    noteCall(t, 'look')
+    expect(verifyNeed(t)).toBeUndefined()
+    expect(t.changed).toEqual(['/p/a.ts', '/p/Page.vue'])
+    expect(t.screens).toEqual(['/p/Page.vue'])
   })
 })

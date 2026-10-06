@@ -36,7 +36,7 @@ export type JevBoard = {
   /** Local midnight of each day of the window, oldest first. */
   dayStarts: number[]
   /** Per feature: its share of the weekly quota saved, a few words, and one value per day (see FeatureStat). */
-  features: Record<'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck', { savedPct?: number; detail: string; daily: (number | undefined)[] }>
+  features: Record<'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck' | 'verify', { savedPct?: number; detail: string; daily: (number | undefined)[] }>
   usage: { asks: number; p50Ms?: number; usd: number; unpriced: number; failed: number }
 }
 
@@ -103,6 +103,8 @@ declare module 'claude-code' {
         paused?: boolean
         /** The done check's mode, as /config or the pane's switch set it. */
         doneCheck?: 'on' | 'off'
+        /** Send Claude back once to check changes nothing ran or looked at. */
+        verify?: 'on' | 'off'
         /** Low effort for quick status questions. */
         effort?: 'on' | 'off'
         /** Skills the project won't need keep only their name in the listing. */

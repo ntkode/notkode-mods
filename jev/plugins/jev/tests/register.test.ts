@@ -179,7 +179,7 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
     }
     return { text: `no such command: ${e.command}` }
   })
-  const config: Record<string, unknown> = { 'jev.doneCheck': 'off', 'jev.effort': 'on', 'jev.skillGate': 'on', 'jev.freshStart': 'on', 'jev.mode': 'on' }
+  const config: Record<string, unknown> = { 'jev.doneCheck': 'off', 'jev.verify': 'on', 'jev.effort': 'on', 'jev.skillGate': 'on', 'jev.freshStart': 'on', 'jev.mode': 'on' }
   on('config.list', () => ({ value: Object.entries(config).map(([key, value]) => ({ key, value })) as never }))
   on('config.set', (_$, e) => {
     config[e.key] = e.value
@@ -761,4 +761,65 @@ test('the board: the options first, then the figures, then a chart per feature b
   expect(spent).toBeLessThan(byDay)
   for (const label of ['hints', 'effort', 'skill gate', 'fresh start', 'done check']) expect(await pane.find({ text: new RegExp(`^${label}\\s+(measuring…|[+-<>].*days|\\d+ stops checked)$`) })).toBeDefined()
   await pane.unmount()
+})
+
+/** A turn that runs `calls`, then stops; the stop's answer. */
+async function verifyTurn($: Engine, calls: Record<string, unknown>[], last = 'Done.', turnId = 'turn-1') {
+  await submit($, 'build the settings screen')
+  await $.turn.start({ text: 'build the settings screen', turnId })
+  await step($, turnId, 0)
+  for (const c of calls) await $.tool.call(c as never)
+  return $.classic.Stop({ stop_hook_active: false, last_assistant_message: last, background_tasks: [], session_crons: [] })
+}
+
+const EDIT_SCREEN = { tool: 'Edit', file_path: "/w/demo-app/src/Settings.tsx", old_string: 'a', new_string: 'b' }
+const EDIT_CODE = { tool: 'Edit', file_path: "/w/demo-app/src/export.ts", old_string: 'a', new_string: 'b' }
+
+test('verify: a screen changed and never looked at sends Claude back once to look at it', { options: { controlPercent: 0 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  // a test run does not show a screen: Claude is still sent to look
+  const first = await verifyTurn($, [EDIT_SCREEN, { tool: 'Bash', command: 'npm test' }])
+  expect(first.block).toMatch(/You changed what the user will see \(Settings\.tsx\)/)
+  // once per turn: the next stop goes through, whatever it did
+  const second = await $.classic.Stop({ stop_hook_active: true, last_assistant_message: 'I could not open a browser here.', background_tasks: [], session_crons: [] })
+  expect(second.block).toBeUndefined()
+  await complete($, w, 'turn-1')
+  expect(logged(w)[0].verify).toEqual({ need: 'look', pushed: true, files: 1 })
+})
+
+test('verify: changes checked after the last edit go through; code needs a run, a screen a look', { options: { controlPercent: 0 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  expect((await verifyTurn($, [EDIT_CODE, { tool: 'Bash', command: 'npx vitest run' }])).block).toBeUndefined()
+  await complete($, w, 'turn-1')
+  expect((await verifyTurn($, [EDIT_SCREEN, { tool: 'mcp__claude-in-chrome__computer', action: 'screenshot' }], 'Done.', 'turn-2')).block).toBeUndefined()
+  await complete($, w, 'turn-2')
+  // a run before the last edit does not count
+  expect((await verifyTurn($, [EDIT_CODE, { tool: 'Bash', command: 'npm test' }, EDIT_CODE], 'Done.', 'turn-3')).block).toMatch(/You changed export\.ts but nothing has run since/)
+  await complete($, w, 'turn-3')
+  expect(logged(w).map(r => r.verify)).toEqual([
+    { pushed: false, files: 1 },
+    { pushed: false, files: 1 },
+    { need: 'run', pushed: true, files: 1 },
+  ])
+})
+
+test('verify: no changes, a question to the person, or verify off: nothing to check', { options: { controlPercent: 0, verify: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  expect((await verifyTurn($, [EDIT_CODE])).block).toBeUndefined()
+  await complete($, w, 'turn-1')
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  await pane.press({ key: 'verify' })
+  await pane.unmount()
+  expect(w.configSets).toEqual(['jev.verify=on'])
+  expect((await verifyTurn($, [{ tool: 'Read', file_path: "/w/demo-app/a.ts" }], 'Done.', 'turn-2')).block).toBeUndefined()
+  await complete($, w, 'turn-2')
+  expect((await verifyTurn($, [EDIT_CODE], 'Should the export include archived rows?', 'turn-3')).block).toBeUndefined()
+  await complete($, w, 'turn-3')
+  expect((await verifyTurn($, [EDIT_CODE], 'Done.', 'turn-4')).block).toMatch(/nothing has run since/)
 })

@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"
@@ -41,6 +41,16 @@
         "off"
       ],
       "default": "off"
+    },
+    "verify": {
+      "type": "string",
+      "title": "Jev: verify",
+      "description": "on: when Claude ends a turn having changed files that nothing ran or looked at since, it is sent back once to check them: a screen it changed, to look at it (browser, simulator, screenshot); other code, to run the tests, the build or the code. off: never.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
     },
     "effort": {
       "type": "string",

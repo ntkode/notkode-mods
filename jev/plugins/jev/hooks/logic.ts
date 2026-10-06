@@ -421,6 +421,89 @@ export function doneVerdict(answers: Readonly<Record<string, Answer>>, at = DONE
 export const DONE_NUDGE =
   "Your last message says more work is coming, but nothing you started is still running and you are not waiting on the user. Carry on with the remaining work now. If something does block you, say plainly what it is and what you need."
 
+// ---------------------------------------------------------------- verify
+
+/** Files whose change shows on a screen: the result is only known by looking at it. */
+const SCREEN_EXT = new Set(['tsx', 'jsx', 'vue', 'svelte', 'astro', 'html', 'htm', 'css', 'scss', 'sass', 'less', 'storyboard', 'xib'])
+const PICTURE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp'])
+
+const extOf = (path: string) => {
+  const name = path.slice(path.lastIndexOf('/') + 1)
+  const dot = name.lastIndexOf('.')
+  return dot <= 0 ? '' : name.slice(dot + 1).toLowerCase()
+}
+
+/** Commands that put a change to the test: tests, builds, type checks, linters, running the code, a request to a server. */
+const RUN_COMMAND =
+  /(^|[\s;&|(])(npm|pnpm|yarn|bun|npx|bunx)\s+(run\s+)?(test|build|lint|typecheck|check|start|dev|e2e|exec)\b|(^|[\s;&|(])(jest|vitest|pytest|mocha|tsc|eslint|ruff|mypy|pyright|rspec|phpunit|xcodebuild|gradle|gradlew|mvn|make|ctest|curl|wget|http|deno|node|python3?|ruby|go\s+(test|build|run|vet)|cargo\s+(test|build|check|run|clippy)|swift\s+(build|test|run)|dotnet\s+(test|build|run)|claude\s+plugin\s+(test|validate))\b/
+
+/** Commands that take a picture of a screen. */
+const LOOK_COMMAND = /\b(screencapture|simctl\s+io\b.*\bscreenshot|playwright|puppeteer|chromium|shot-scraper)\b/
+
+/** Tools that see a screen: a browser, a simulator, a screenshot. */
+const LOOK_TOOL = /screenshot|browser|playwright|puppeteer|chrome|preview|simulator|computer/i
+
+export type VerifyNeed = 'look' | 'run'
+
+/** What a tool call does for verification: changes a file (and whether it shows), runs it, looks at it, or nothing. */
+export function verifyRole(tool: string, input: { file_path?: unknown; notebook_path?: unknown; command?: unknown }): { change: string; screen: boolean } | 'run' | 'look' | undefined {
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    const path = String(input.file_path ?? input.notebook_path ?? '')
+    return { change: path, screen: SCREEN_EXT.has(extOf(path)) }
+  }
+  if (tool === 'Bash' && typeof input.command === 'string') {
+    if (LOOK_COMMAND.test(input.command)) return 'look'
+    if (RUN_COMMAND.test(input.command)) return 'run'
+    return undefined
+  }
+  if (tool === 'Read' && PICTURE_EXT.has(extOf(String(input.file_path ?? '')))) return 'look'
+  if (LOOK_TOOL.test(tool)) return 'look'
+  return undefined
+}
+
+/** A turn's changes and checks, in the order they happened. */
+export type VerifyTrail = { seq: number; changed: string[]; screens: string[]; lastChange: number; lastRun: number; lastLook: number }
+
+export function newTrail(): VerifyTrail {
+  return { seq: 0, changed: [], screens: [], lastChange: -1, lastRun: -1, lastLook: -1 }
+}
+
+export function noteCall(trail: VerifyTrail, role: ReturnType<typeof verifyRole>): void {
+  if (role === undefined) return
+  const at = ++trail.seq
+  if (role === 'run') trail.lastRun = at
+  else if (role === 'look') trail.lastLook = at
+  else {
+    trail.lastChange = at
+    if (role.change && !trail.changed.includes(role.change)) trail.changed.push(role.change)
+    if (role.screen && role.change && !trail.screens.includes(role.change)) trail.screens.push(role.change)
+  }
+}
+
+/**
+ * Whether the turn's changes went unchecked at its stop: a screen changed and nobody looked after
+ * the last change, or code changed and nothing ran or looked after it. Undefined: nothing to check.
+ */
+export function verifyNeed(trail: VerifyTrail): VerifyNeed | undefined {
+  if (trail.lastChange < 0) return undefined
+  if (trail.screens.length > 0) return trail.lastLook > trail.lastChange ? undefined : 'look'
+  return Math.max(trail.lastRun, trail.lastLook) > trail.lastChange ? undefined : 'run'
+}
+
+/** What Claude reads when it stops with its changes unchecked. */
+export function verifyNudge(need: VerifyNeed, trail: VerifyTrail): string {
+  const names = (paths: readonly string[]) => {
+    const short = paths.map(p => p.slice(p.lastIndexOf('/') + 1))
+    return short.length <= 4 ? short.join(', ') : `${short.slice(0, 4).join(', ')} and ${short.length - 4} more`
+  }
+  if (need === 'look')
+    return `You changed what the user will see (${names(trail.screens)}) but have not looked at the result. Before you finish, open it (a browser, a simulator or a screenshot), look at it as the user will, and compare it with what they asked for; fix what is off. If you have no way to see it here, say so plainly in your report instead of calling it done.`
+  return `You changed ${names(trail.changed)} but nothing has run since. Before you finish, check it: run the tests, the build or the code you changed, and read your diff once. If there is no way to run it here, say so plainly in your report, and what is left unchecked.`
+}
+
+/** The verify check at a turn's stop, for the log: whether the changes were checked on Claude's own, or Claude was sent back. */
+export type VerifyCheck = { need?: VerifyNeed; pushed: boolean; files: number }
+
 /** The done check in plain words, for the pane. */
 export function doneText(d: Pick<DoneCheck, 'verdict' | 'pushed'>, shadow: boolean): string {
   switch (d.verdict) {
@@ -588,6 +671,8 @@ export type TurnRecord = {
   done?: DoneCheck
   /** What Jev made of the prompt, and what the mod did with it. */
   triage?: Triage & { lowEffort?: 'applied' | 'shadow' | 'exited' | 'control'; fresh?: 'clear' | 'compact' | 'kept' | 'dismissed' }
+  /** Whether the turn's file changes were checked: on Claude's own, or after being sent back. */
+  verify?: VerifyCheck
   /** Tokens per request each feature took off the context Claude re-reads (skill gate, an earlier fresh start). */
   saved?: { skills?: number; fresh?: number }
 }
@@ -794,7 +879,7 @@ export function turnUnits(u: NonNullable<TurnRecord['actual']['usage']>): number
   return u.input * UNIT_WEIGHTS.input + u.cacheRead * UNIT_WEIGHTS.cacheRead + u.cacheWrite * UNIT_WEIGHTS.cacheWrite + u.output * UNIT_WEIGHTS.output
 }
 
-export type FeatureKey = 'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck'
+export type FeatureKey = 'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck' | 'verify'
 
 /** What one feature did over the window: its share of the weekly quota saved (negative: it cost), and a few words. */
 export type FeatureStat = {
@@ -874,6 +959,10 @@ export function board(records: readonly LogRecord[], days: number, now = Math.ma
   const done = turns.filter(t => t.done)
   const pushed = done.filter(t => t.done!.verdict === 'push').length
 
+  const changed = turns.filter(t => t.verify)
+  const sentBack = changed.filter(t => t.verify!.pushed)
+  const lookedBack = sentBack.filter(t => t.verify!.need === 'look').length
+
   const ms = turns.flatMap(t => t.jev?.ms ?? [])
   const failed = turns.reduce((s, t) => s + Object.entries(t.jev?.reasons ?? {}).filter(([k]) => k === 'jev_error' || k === 'jev_timeout').reduce((a, [, n]) => a + n, 0), 0)
 
@@ -904,6 +993,10 @@ export function board(records: readonly LogRecord[], days: number, now = Math.ma
         detail: `${freshTurns.length} fresh starts`,
       },
       doneCheck: { daily: perDay(done, g => g.length), detail: `${done.length} stops checked · ${pushed} broken promises` },
+      verify: {
+        daily: perDay(sentBack, g => g.length),
+        detail: `${changed.length} turns changed files · ${changed.length - sentBack.length} checked on their own · ${sentBack.length} sent back${lookedBack > 0 ? ` (${lookedBack} to look at a screen)` : ''}`,
+      },
     },
     usage: {
       asks: asked,

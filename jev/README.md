@@ -42,6 +42,11 @@ watch it happen and measure whether it helps on your own work.
   is coming ("I'll report when it lands"), with nothing left running and nothing asked of you, Jev
   sends Claude back to work, once per turn. Off by default.
   Backtested on 14 days of real turns before shipping.
+- **Makes Claude check its work** (verify). When Claude ends a turn having changed files that
+  nothing ran or looked at since, it is sent back once: a screen it changed (`.tsx`, `.vue`,
+  `.html`, `.css`…) to look at it in a browser, a simulator or a screenshot; other code to run the
+  tests, the build or the code. If it has no way to check, it says so instead of calling it done.
+  Not when Claude ends on a question to you, nor while work still runs. On by default.
 - **Respects private work.** Repos you exclude never ask Jev, so their conversations never reach
   it, and their prompts stay out of the plugin's log.
 
@@ -82,11 +87,11 @@ the key is never shown or passed on a command line. Keys in the environment (`OP
 `TYPESAFE_API_KEY`, …) work too and win over the file.
 
 Open the board with `/jev`. At the top, the options: each feature on or off (keys `h` hints, `e`
-effort, `k` skill gate, `t` fresh start, `d` done check). Then the two figures that matter over the
+effort, `k` skill gate, `t` fresh start, `d` done check, `v` verify). Then the two figures that matter over the
 last 7 days: what Jev cost, and how much of the weekly quota it saved. Then the features table, each
 with its own share of that saving, and under it a chart per feature, one column a day: green what it
 saved that day, yellow hanging below the line what it cost; the done check charts the stops it
-checked. Every feature works on its own.
+checked, verify the turns it sent back to check. Every feature works on its own.
 
 ## Settings
 
@@ -97,6 +102,7 @@ In `/config`, under the plugin:
 | Jev: hints | `on` | `on`: Claude gets Jev's confident tool picks as a hint. `off`: no hints |
 | Jev: control group (%) | `20` | this share of turns runs with no Jev feature, the baseline for hints and effort. `0` turns it off |
 | Jev: done check | `off` | `on`: Claude is sent back to work after a broken promise, once per turn |
+| Jev: verify | `on` | `on`: changes nothing ran or looked at send Claude back once to check them (screens: look; code: run) |
 | Jev: effort | `on` | `on`: quick status questions at low effort, same model |
 | Jev: skill gate | `on` | `on`: skills the project won't need keep only their name |
 | Jev: fresh start | `on` | `on`: offer `/clear` or `/compact` when a new task starts in a long conversation |
