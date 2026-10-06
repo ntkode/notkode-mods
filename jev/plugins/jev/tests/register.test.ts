@@ -256,7 +256,7 @@ test('asks Jev before the first request and after the tools; each hint rides the
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
-  expect(await lines($)).toEqual(['ready when you are', 'idle'])
+  expect(await lines($)).toEqual(['ready when you are'])
 
   const sent = await submit($, 'why does the test fail?')
   expect(sent).toMatchObject({ context: [hintText('Read')] })
@@ -292,7 +292,7 @@ test('asks Jev before the first request and after the tools; each hint rides the
     // Claude called Read after the first hint, not Bash after the second
     jev: { asked: 2, hinted: 2, followed: 1, cards: ['pick', 'pick'] },
   })
-  expect(await lines($)).toEqual(['ready when you are', 'idle'])
+  expect(await lines($)).toEqual(['ready when you are'])
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
   expect(await pane.find({ text: /1 hints in 1 turns|measuring: 1\/5 with, 0\/5 control/ })).toBeDefined()
@@ -333,15 +333,15 @@ test('the band follows the turn: Jev deciding, its card landing, then Claude thi
   w.messages = () => [{ role: 'user', text: 'what changed?', toolUses: [] }]
   w.responses.push([{ name: 'Read', input: { file_path: 'x.ts' } }])
   await step($, 'turn-1', 0)
-  // once the card has crossed, Claude's request shows
+  // once the card has crossed, Claude's request shows, and Jev, done, says nothing
   await clock.advance(7 * 180)
-  expect(await lines($)).toEqual(['thinking…', 'hinted Read 0.90'])
+  expect(await lines($)).toEqual(['thinking…'])
 
   let done = () => {}
   w.toolHold = new Promise<void>(r => (done = r))
   const call = $.tool.call({ tool: 'Read', file_path: 'x.ts' })
   await settle(() => w.toolUseIds.length === 1)
-  expect(await lines($)).toEqual(['running Read', 'hinted Read 0.90'])
+  expect(await lines($)).toEqual(['running Read'])
   done()
   await call
   expect(w.asks).toHaveLength(2)
@@ -388,7 +388,7 @@ test('a control turn: Jev sits it out, the owl sleeps, and the band says why', {
   await $.turn.start({ text: 'hello', turnId: 'turn-1' })
   w.responses.push([{ name: 'Bash', input: { command: 'ls' } }])
   await step($, 'turn-1', 0)
-  expect(await lines($)).toEqual(['thinking…', 'zzz · control turn'])
+  expect(await lines($)).toEqual(['thinking…'])
   const bash = await $.tool.call({ tool: 'Bash', command: 'ls' })
   expect('context' in bash ? bash.context : undefined).toBeUndefined()
   await step($, 'turn-1', 1)
@@ -452,7 +452,7 @@ test('/jev-setup checks the key with one call, saves it without it reaching argv
   expect(w.runs.some(argv => argv.join(' ').includes(KEY))).toBe(false)
   expect(w.runs).toContainEqual(['chmod', '600', KEY_FILE])
   expect(w.runs.some(argv => argv[0] === 'pbcopy')).toBe(true)
-  expect(await lines($)).toEqual(['ready when you are', 'idle'])
+  expect(await lines($)).toEqual(['ready when you are'])
 })
 
 test('/jev-setup switching provider drops the old provider\'s model name', HINTS, async ($, on) => {
@@ -601,7 +601,7 @@ test('a reload (no session.start) sets the session up on first use: the key is r
   const sent = await plainTurn($, w, 'why does the test fail?')
   expect(sent).toMatchObject({ context: [hintText('Read')] })
   expect(logged(w)[0]).toMatchObject({ arm: 'hint', project: 'demo-app' })
-  expect(await lines($)).toEqual(['ready when you are', 'idle'])
+  expect(await lines($)).toEqual(['ready when you are'])
 })
 
 test('effort: a quick status question runs at low effort on the same model, and goes back to your effort once it grows', HINTS, async ($, on) => {

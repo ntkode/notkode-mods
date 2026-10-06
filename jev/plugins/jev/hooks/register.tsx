@@ -554,34 +554,33 @@ function answerLine(d: { mode: 'hint' | 'pass'; reason?: string; tool?: string; 
 
 /**
  * What each one says this moment: Claude in the balloon on its left, Jev in the one on its right.
- * The one working speaks in color; the other waits, dim. Jev's balloon also carries how the turn
- * is run when that is not the usual (paused, shadow, a control turn, hints off).
+ * A balloon shows only while its one is on the task: Jev's while it decides and its answer
+ * travels back, none while it rests (idle, or Claude thinking and working). Claude's shows always,
+ * in color while it works.
  */
-function speech(s: { state: string; mode: string; paused?: boolean }, scene: Scene, d: { mode: 'hint' | 'pass'; reason?: string; tool?: string; confidence?: number } | null, shadow: boolean, step: { arm?: JevArm; tool?: string } | null): { claude: Line; jev: Line } {
-  const waiting: Line = { text: '…', dim: true }
-  const asleep = step?.arm === 'control' ? 'zzz · control turn' : step?.arm === 'off' ? (s.paused ? 'zzz · paused' : 'zzz · hints off') : undefined
-  const resting: Line = asleep ? { text: asleep, dim: true } : d ? { text: answerLine(d, shadow).text, dim: true } : waiting
+function speech(scene: Scene, d: { mode: 'hint' | 'pass'; reason?: string; tool?: string; confidence?: number } | null, shadow: boolean, step: { tool?: string } | null): { claude: Line; jev: Line | null } {
+  const deciding: Line = { text: 'hmm… deciding', color: 'yellow' }
   switch (scene) {
     case 'unset':
       return { claude: { text: 'no Jev yet', dim: true }, jev: { text: 'not set up · run /jev-setup', dim: true } }
-    case 'idle': {
-      const jev = s.paused ? 'zzz · paused' : s.mode === 'off' ? 'hints off' : s.mode === 'shadow' ? 'watching, in shadow' : 'idle'
-      return { claude: { text: 'ready when you are', dim: true }, jev: { text: jev, dim: true } }
-    }
+    case 'idle':
+      return { claude: { text: 'ready when you are', dim: true }, jev: null }
     case 'asking':
-      return { claude: { text: 'Jev, what next?', dim: true }, jev: { text: 'hmm… deciding', color: 'yellow' } }
+      return { claude: { text: 'Jev, what next?', dim: true }, jev: deciding }
     case 'answering':
-      return { claude: waiting, jev: d ? answerLine(d, shadow) : { text: 'hmm… deciding', color: 'yellow' } }
+      return { claude: { text: '…', dim: true }, jev: d ? answerLine(d, shadow) : deciding }
     case 'thinking':
-      return { claude: { text: 'thinking…', color: '#d97757' }, jev: resting }
+      return { claude: { text: 'thinking…', color: '#d97757' }, jev: null }
     case 'working':
-      return { claude: { text: step?.tool ? `running ${step.tool}` : 'working…', color: '#d97757' }, jev: resting }
+      return { claude: { text: step?.tool ? `running ${step.tool}` : 'working…', color: '#d97757' }, jev: null }
   }
 }
 
 /** A speech balloon `width` cells wide at most, its tail pointing at the one speaking. */
-function balloon($: $, e: Parameters<$['ui']['resolve']>[0], line: Line, width: number, border: string, tail: 'left' | 'right'): RenderElement {
+function balloon($: $, e: Parameters<$['ui']['resolve']>[0], line: Line | null, width: number, border: string, tail: 'left' | 'right'): RenderElement {
   const { Box, Text } = $.ui.resolve(e)
+  // No words: the room stays, so the scene does not move when a balloon comes and goes.
+  if (!line) return <Box width={width} />
   const fit = Math.min(width - 1, line.text.length + 4)
   const body = (
     <Box borderStyle="round" borderColor={border} paddingX={1} width={fit}>
@@ -610,7 +609,7 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
   const step = await read($, phase)
   const d = await read($, decision)
   const { Box, Text } = $.ui.resolve(e)
-  const says = speech(s, now.scene, d, now.shadow, step)
+  const says = speech(now.scene, d, now.shadow, step)
   const said = (line: Line) => (
     <Text color={line.color} dimColor={line.dim}>
       {line.text}
@@ -628,7 +627,7 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
       return (
         <Box flexDirection="row" marginTop={1} alignItems="center">
           {scene}
-          <Box marginLeft={2}>{said(now.scene === 'thinking' || now.scene === 'working' ? says.claude : says.jev)}</Box>
+          <Box marginLeft={2}>{said(says.jev ?? says.claude)}</Box>
         </Box>
       )
     }
@@ -646,8 +645,8 @@ async function drawBand($: $, e: Parameters<$['ui']['resolve']>[0] & { requestId
       <Text color={ANIMATED.has(now.scene) ? 'yellow' : 'cyan'}>◆ </Text>
       <Text dimColor>Claude: </Text>
       {said(says.claude)}
-      <Text dimColor> · Jev: </Text>
-      {said(says.jev)}
+      {says.jev ? <Text dimColor> · Jev: </Text> : null}
+      {says.jev ? said(says.jev) : null}
     </Box>
   )
 }
