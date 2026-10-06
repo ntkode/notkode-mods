@@ -30,6 +30,15 @@ watch it happen and measure whether it helps on your own work.
   and Jev's calls as the provider prices them) and how much of your weekly quota is used. Once 5
   turns with hints and 5 control turns are logged, it estimates what hints saved per turn, in
   dollars and as a share of the weekly quota, net of Jev's cost.
+- **Saves quota where it goes** (see [research 09](research/results/09-where-the-quota-goes.md):
+  most of it is context Claude re-reads on every request):
+  - **Skill gate:** at session start Jev judges which of your skills this project needs; the
+    others keep only their name in the list Claude reads on every request (still callable). In
+    this repo, 55 skills: 39 reduced to their names.
+  - **Effort:** quick status questions ("are we done?", "is it in prod?") run at low effort, on
+    the same model, back to your effort if the turn grows past 8 requests.
+  - **Fresh start:** when a prompt starts a new task that needs nothing from a long
+    conversation (100k+ tokens), Jev offers `/clear` or `/compact` first, then sends your prompt.
 - **Catches a stop on a broken promise** (done check). When Claude stops after saying more work
   is coming ("I'll report when it lands"), with nothing left running and nothing asked of you, Jev
   catches it. In `shadow` (the default) it is only recorded in `/jev`; set it `on` and Claude is
@@ -76,7 +85,7 @@ the key is never shown or passed on a command line. Keys in the environment (`OP
 
 Open the pane with `/jev`. It shows where Jev runs, what it answered on the last turn, the session's
 totals and spend, the last 7 days (what Jev answered, hints vs control, spend and savings), and
-switches to pause Jev for this session and to set the done check (shadow, on, off).
+switches for each feature (done check `d`, effort `e`, skill gate `k`, fresh start `t`) and to pause Jev for this session.
 
 ## Settings
 
@@ -87,6 +96,9 @@ In `/config`, under the plugin:
 | Jev: hints | `on` | `on`: Claude gets Jev's confident picks. `shadow`: Jev is asked and its picks are recorded, but Claude never sees them. `off`: Jev is never asked |
 | Jev: control group (%) | `20` | with hints on, this share of turns runs without Jev, for the `/jev` pane to compare. `0` turns it off |
 | Jev: done check | `shadow` | `shadow`: broken promises are recorded in `/jev`. `on`: Claude is sent back to work, once per turn. `off`: stops are never checked |
+| Jev: effort | `on` | `on`: quick status questions at low effort (same model). `shadow`: recorded only. `off` |
+| Jev: skill gate | `on` | `on`: skills the project won't need keep only their name. `shadow`: recorded only. `off` |
+| Jev: fresh start | `ask` | `ask`: offer `/clear` or `/compact` when a new task starts in a long conversation. `off` |
 | Jev: excluded repos | empty | comma-separated folder names where Jev is never asked |
 
 Options are stored per install: a marketplace install (`jev@notkode-mods`) and a `--plugin-dir` copy

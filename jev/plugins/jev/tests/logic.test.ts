@@ -11,6 +11,8 @@ import {
   cleanPrompt,
   decide,
   decisionText,
+  gateListing,
+  parseSkillListing,
   doneVerdict,
   dollars,
   economy,
@@ -183,6 +185,16 @@ describe('turns and decisions', () => {
     tally(j, { mode: 'pass', reason: 'low_confidence', confidence: 0.4 }, 300)
     tally(j, { mode: 'pass', reason: 'jev_error: HTTP 500' }, 90)
     expect(j).toEqual({ asked: 3, hinted: 1, followed: 0, picks: [{ tool: 'Read', confidence: 0.9 }], reasons: { low_confidence: 1, jev_error: 1 }, ms: [240, 300, 90], cards: ['pick', 'pass', 'fail'], usd: 0, unpriced: 0 })
+  })
+})
+
+describe('the skill gate', () => {
+  test('reads the listing: names with a plugin prefix, descriptions over several lines, bullets inside them', () => {
+    const text = ['- codex:rescue: Delegate to Codex.', '- higgsfield-generate: Generate images.', 'Use when:', '- "make a video"', '- Use when: asked for art.', '- review: Review the diff.'].join('\n')
+    const l = parseSkillListing(text)!
+    expect(l.entries.map(e => e.name)).toEqual(['codex:rescue', 'higgsfield-generate', 'review'])
+    expect(gateListing(l, new Set(['higgsfield-generate']))).toBe(['- codex:rescue: Delegate to Codex.', '- higgsfield-generate', '- review: Review the diff.'].join('\n'))
+    expect(gateListing(l, new Set())).toBe(text)
   })
 })
 

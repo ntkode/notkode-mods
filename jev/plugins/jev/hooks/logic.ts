@@ -435,6 +435,130 @@ export function doneText(d: Pick<DoneCheck, 'verdict' | 'pushed'>, shadow: boole
   }
 }
 
+// ---------------------------------------------------------------- triage: effort and topic switches
+
+/** The effort classes Jev chooses from (as backtested in research/results/02-fast-lane-cross-check.md). */
+export const EFFORT_CRITERIA: Record<string, string> = {
+  status: 'A quick question about state or status that needs a short lookup and a short answer, little reasoning: "is it in prod?", "are we done?", "what is next?", "did it work?".',
+  routine: 'Small, mechanical work with an obvious approach: run a known command, commit or push, a tiny edit, rename, or approving a step whose remaining work is small. Read the conversation: "yes" that approves a big build is NOT routine.',
+  standard: 'Normal engineering or writing work with some investigation: implement or change a feature, fix a specific bug, write a document, analyze data.',
+  hard: 'Needs deep, careful reasoning: architecture or design decisions, subtle or multi-system bugs, large refactors, ambiguous requirements, security, or analysis where a wrong call is costly.',
+}
+
+/** One call per prompt: how much reasoning it needs, and whether it opens a new, unrelated task. */
+export const TRIAGE_QUESTIONS: Record<'effort' | 'quick' | 'newTopic' | 'needsEarlier', Question> = {
+  effort: {
+    type: 'choice',
+    instructions: "How much reasoning will the coding assistant need to answer the user's LATEST message well? Judge by the work it triggers, using the conversation for context, not by how long the message is.",
+    criteria: EFFORT_CRITERIA,
+  },
+  quick: {
+    type: 'noul',
+    instructions:
+      "Is the user's latest message a quick question about status or state (is it deployed, did it work, are we done, what is next) that the assistant can answer with a short look-up, WITHOUT doing new work such as building, fixing, writing, running a process, or opening something?",
+  },
+  newTopic: { type: 'noul', instructions: "Does the user's LATEST message start a new task, unrelated to what the earlier conversation was about?" },
+  needsEarlier: {
+    type: 'noul',
+    instructions: "To do what the LATEST message asks, does the assistant need anything from the earlier conversation: something said, done, decided or found there, or a reference to it ('that', 'the same', 'as before')?",
+  },
+}
+
+/** Both checks must clear this before a turn runs at low effort (the backtested rule: 3.7% turned out heavy). */
+export const QUICK_CONFIDENCE = 0.7
+/** A low-effort turn that grows past this many requests goes back to the session's effort. */
+export const LOW_EFFORT_STEPS = 8
+/** Jev must be this sure of a new, self-contained task before a fresh start is offered. */
+export const TOPIC_CONFIDENCE = 0.9
+/** A fresh start is offered only when the context holds at least this many tokens (the fixed base alone is 30–55k). */
+export const TOPIC_MIN_TOKENS = 100_000
+
+export type Triage = {
+  /** A quick status question: run the turn at low effort. */
+  quick: boolean
+  /** A new task that needs nothing from the conversation so far. */
+  newTopic: boolean
+  effort?: string
+  effortConfidence?: number
+  quickP?: number
+  newTopicP?: number
+  needsEarlierP?: number
+}
+
+export function triage(answers: Readonly<Record<string, Answer>>): Triage {
+  const noul = (k: string) => {
+    const a = answers[k]
+    return a?.type === 'noul' ? a.noul : undefined
+  }
+  const e = answers.effort?.type === 'choice' ? answers.effort : undefined
+  const quickP = noul('quick')
+  const newTopicP = noul('newTopic')
+  const needsEarlierP = noul('needsEarlier')
+  return {
+    quick: e?.choice === 'status' && e.confidence >= QUICK_CONFIDENCE && (quickP ?? 0) >= QUICK_CONFIDENCE,
+    newTopic: (newTopicP ?? 0) >= TOPIC_CONFIDENCE && (needsEarlierP ?? 1) <= 1 - TOPIC_CONFIDENCE,
+    ...(e ? { effort: e.choice, effortConfidence: e.confidence } : {}),
+    ...(quickP !== undefined ? { quickP } : {}),
+    ...(newTopicP !== undefined ? { newTopicP } : {}),
+    ...(needsEarlierP !== undefined ? { needsEarlierP } : {}),
+  }
+}
+
+// ---------------------------------------------------------------- the skill gate
+
+/** One skill of the listing Claude reads: its name and the whole entry as the engine wrote it. */
+export type SkillEntry = { name: string; entry: string }
+
+/** The listing's entries (`- name: description`, descriptions may span lines); undefined when it is not that shape. */
+export function parseSkillListing(text: string): { head: string; entries: SkillEntry[] } | undefined {
+  const lines = text.split('\n')
+  const head: string[] = []
+  const entries: SkillEntry[] = []
+  for (const line of lines) {
+    // A skill's name has no spaces and may carry one plugin prefix (`codex:rescue`).
+    const m = /^- ([\w.-]+(?::[\w.-]+)?): /.exec(line)
+    if (m) entries.push({ name: m[1]!, entry: line })
+    else if (entries.length > 0) entries[entries.length - 1]!.entry += `\n${line}`
+    else head.push(line)
+  }
+  return entries.length >= 3 ? { head: head.join('\n'), entries } : undefined
+}
+
+/** A skill must be at least this likely to matter to keep its description; the rest keep their name. */
+export const SKILL_KEEP = 0.5
+
+/** One question per skill: will this project's work use it? */
+export function skillQuestions(entries: readonly SkillEntry[]): Record<string, Question> {
+  return Object.fromEntries(
+    entries.map((e, i) => [
+      `skill:${i}`,
+      {
+        type: 'noul',
+        instructions: `Is the assistant likely to need this skill for work in this project? ${truncate(e.entry.replace(/^- /, ''), 600)}`,
+      },
+    ]),
+  )
+}
+
+/** The names of the skills Jev judged unlikely to matter; any skill Jev did not answer for stays. */
+export function skillsToTrim(entries: readonly SkillEntry[], answers: Readonly<Record<string, Answer>>, keep = SKILL_KEEP): string[] {
+  return entries.filter((e, i) => {
+    const a = answers[`skill:${i}`]
+    return a?.type === 'noul' && a.noul < keep
+  }).map(e => e.name)
+}
+
+/** The listing with the trimmed skills reduced to their names: still listed, still callable. */
+export function gateListing(listing: { head: string; entries: readonly SkillEntry[] }, trim: ReadonlySet<string>): string {
+  const body = listing.entries.map(e => (trim.has(e.name) ? `- ${e.name}` : e.entry))
+  return [...(listing.head ? [listing.head] : []), ...body].join('\n')
+}
+
+/** Tokens in a text, roughly (for the pane's before/after). */
+export function approxTokens(text: string): number {
+  return Math.round(text.length / 4)
+}
+
 // ---------------------------------------------------------------- the log
 
 export type TurnRecord = {
@@ -462,6 +586,8 @@ export type TurnRecord = {
   jev?: JevTurn
   /** The done check at the turn's last stop. */
   done?: DoneCheck
+  /** What Jev made of the prompt, and what the mod did with it. */
+  triage?: Triage & { lowEffort?: 'applied' | 'shadow' | 'exited'; fresh?: 'clear' | 'compact' | 'kept' | 'dismissed' }
 }
 
 export type LogRecord = TurnRecord
@@ -558,6 +684,17 @@ export function report(records: readonly LogRecord[], days: number): string {
       '',
       `Done check: ${checked.length} stops checked · ${would.length} broken promises (${pct(would.length, checked.length)})${pushed.length < would.length ? `, ${would.length - pushed.length} only recorded (shadow)` : ''} · ${running.length} left work running.`,
     )
+  }
+  const low = turns.filter(t => t.triage?.lowEffort)
+  const offered = turns.filter(t => t.triage?.fresh && t.triage.fresh !== 'clear' && t.triage.fresh !== 'compact')
+  const fresh = turns.filter(t => t.triage?.fresh === 'clear' || t.triage?.fresh === 'compact')
+  if (low.length > 0 || offered.length + fresh.length > 0) {
+    const exited = low.filter(t => t.triage!.lowEffort === 'exited').length
+    const shadowed = low.filter(t => t.triage!.lowEffort === 'shadow').length
+    lines.push('')
+    if (low.length > 0)
+      lines.push(`Effort: ${low.length} quick status questions${shadowed ? ` (${shadowed} only recorded)` : ' ran at low effort'} · ${exited} grew and went back to your effort · median ${median(low.map(t => t.actual.steps))} requests.`)
+    if (offered.length + fresh.length > 0) lines.push(`Fresh start: offered ${offered.length + fresh.length} times on a new task · taken ${fresh.length}.`)
   }
   lines.push('', ...economyLines(economy(records, days)))
   return lines.join('\n')

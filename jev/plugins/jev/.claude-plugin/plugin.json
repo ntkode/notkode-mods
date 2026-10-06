@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"
@@ -43,6 +43,38 @@
         "off"
       ],
       "default": "shadow"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Jev: effort",
+      "description": "on: quick status questions (is it deployed, are we done) run at low effort, on the same model, back to your effort if the turn grows. shadow: recorded only. off: your effort always.",
+      "options": [
+        "on",
+        "shadow",
+        "off"
+      ],
+      "default": "on"
+    },
+    "skillGate": {
+      "type": "string",
+      "title": "Jev: skill gate",
+      "description": "on: at session start Jev judges which skills this project needs; the others keep only their name in the list Claude reads on every request (still callable). shadow: recorded only. off: the full list.",
+      "options": [
+        "on",
+        "shadow",
+        "off"
+      ],
+      "default": "on"
+    },
+    "freshStart": {
+      "type": "string",
+      "title": "Jev: fresh start",
+      "description": "ask: when a prompt starts a new task that needs nothing from a long conversation, Jev offers /clear or /compact before sending it. off: never asks.",
+      "options": [
+        "ask",
+        "off"
+      ],
+      "default": "ask"
     },
     "excludedRepos": {
       "type": "string",

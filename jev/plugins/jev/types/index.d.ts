@@ -90,6 +90,12 @@ declare module 'claude-code' {
         paused?: boolean
         /** The done check's mode, as /config or the pane's switch set it. */
         doneCheck?: 'shadow' | 'on' | 'off'
+        /** Low effort for quick status questions. */
+        effort?: 'on' | 'shadow' | 'off'
+        /** Skills the project won't need keep only their name in the listing. */
+        skillGate?: 'on' | 'shadow' | 'off'
+        /** Offer /clear or /compact when a new task starts in a long conversation. */
+        freshStart?: 'ask' | 'off'
       }
       last: JevTurnView | null
       session: JevSessionView
@@ -97,6 +103,8 @@ declare module 'claude-code' {
       phase: { name: 'asking' | 'thinking' | 'working'; at: number; arm: JevArm; tool?: string } | null
       /** Jev's newest answer in the running turn. */
       decision: { mode: 'hint' | 'pass'; tool?: string; confidence?: number; reason?: string; shadow?: boolean; at: number } | null
+      /** The skill gate's decision for the session: the same listing all session long, reloads included. */
+      skills: { session: string; mode: 'on' | 'shadow'; trim: string[]; count: number; before: number; after: number } | null
       /** The last 7 days from the log, as the pane's lines (answers, hints vs control, spend, savings); refreshed after each turn. */
       week: string[] | null
       /** ANTHROPIC_BASE_URL before v0.4 routed the session through its gateway: read once, to undo that. */

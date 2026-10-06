@@ -18,6 +18,19 @@ const TOOLS = [
   { name: 'Bash', description: 'Runs a shell command.', mcp: false },
 ]
 
+/** Jev's answer to the prompt triage: the effort class and its two checks. */
+const triageAnswer = (o: { effort?: string; confidence?: number; quick?: number; newTopic?: number; needsEarlier?: number } = {}): JevReply => ({
+  status: 200,
+  body: {
+    answers: {
+      effort: { type: 'choice', choice: o.effort ?? 'standard', confidence: o.confidence ?? 0.8, probabilities: {} },
+      quick: { type: 'noul', noul: o.quick ?? 0.1 },
+      newTopic: { type: 'noul', noul: o.newTopic ?? 0.1 },
+      needsEarlier: { type: 'noul', noul: o.needsEarlier ?? 0.9 },
+    },
+  },
+})
+
 /** Jev's answer: `tool` at `confidence`, and "a tool is needed" at `noul`. */
 const answer = (tool: string, confidence = 0.9, noul = 0.8) => ({
   status: 200,
@@ -48,13 +61,28 @@ type World = {
   usage: { usd: number; week?: number }
   /** Options the mod wrote through $.config.set. */
   configSets: string[]
+  /** Jev's next answers to the prompt triage (effort, new topic); once empty, a plain prompt. */
+  triage: JevReply[]
+  /** What each triage call carried. */
+  triageAsks: { state: { conversation: unknown[] } }[]
+  /** Jev's answer to the skill gate: per skill index, how likely it is needed. */
+  skillAnswer?: (i: number) => number
+  skillAsks: { state: { conversation: { text?: string }[] }; questions: Record<string, unknown> }[]
+  /** The tokens the session's context holds now. */
+  contextTokens: number
+  /** Commands the mod ran, and prompts it sent. */
+  commands: string[]
+  submitted: string[]
+  /** The effort each main-loop request went out with. */
+  efforts: (string | number | undefined)[]
+  toasts: string[]
 }
 
 type Setup = { key?: boolean; env?: Record<string, string> }
 
 /** The world beneath the plugin: the environment, files, the conversation, Jev's API, the model, the tools, the clipboard. */
 function world(on: On, clock: MockClock, setup: Setup = {}): World {
-  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [], usage: { usd: 0 }, configSets: [] }
+  const w: World = { env: { HOME, ...setup.env }, files: {}, runs: [], answers: [], messages: () => [], asks: [], jev: [], responses: [], toolUseIds: [], usage: { usd: 0 }, configSets: [], triage: [], triageAsks: [], skillAsks: [], contextTokens: 20_000, commands: [], submitted: [], efforts: [], toasts: [] }
   if (setup.key !== false) w.files[KEY_FILE] = `JEV_PROVIDER=openrouter\nOPENROUTER_API_KEY=${KEY}\n`
 
   on('env.get', (_$, e) => ({ value: w.env[e.name] }))
@@ -83,6 +111,18 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   on('http.fetch', async (_$, e) => {
     if (e.url !== JEV_URL) return { deny: 'connect ECONNREFUSED' }
     const body = JSON.parse(e.init?.body ?? '{}')
+    const keys = Object.keys(body.questions ?? {})
+    const ok = (answers: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } })
+    if (keys.includes('newTopic')) {
+      w.triageAsks.push(body)
+      const r = w.triage.shift() ?? triageAnswer()
+      if (r.hold) await r.hold
+      return { value: { status: r.status, ok: r.status < 400, headers: {}, text: JSON.stringify(r.body ?? {}) } }
+    }
+    if (keys.every(k => k.startsWith('skill:'))) {
+      w.skillAsks.push(body)
+      return ok(Object.fromEntries(keys.map(k => [k, { type: 'noul', noul: (w.skillAnswer ?? (() => 0.9))(Number(k.slice(6))) }])))
+    }
     w.asks.push({ ...body, auth: e.init?.headers?.authorization ?? '' })
     const reply: JevReply = w.jev.shift() ?? answer('Read')
     if (reply.hold) await reply.hold
@@ -96,17 +136,23 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   on('session.usage', () => ({
     value: {
       startedAt: 0,
-      context: {} as never,
+      context: { tokens: w.contextTokens, window: 1_000_000 } as never,
       rateLimits: w.usage.week !== undefined ? [{ kind: 'seven_day', percentUsed: w.usage.week, resetsAt: '2026-10-05T14:00:00' }] : [],
       cost: { usd: w.usage.usd },
     },
   }))
   on('tool.list', () => ({ value: TOOLS }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => {
+    w.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.log', () => ({ value: undefined }))
   on('ui.blit', () => ({ value: {} }))
-  on('prompt.submit', (_$, e) => ({ text: e.text, ...(e.context ? { context: e.context } : {}) }))
+  on('prompt.submit', (_$, e) => {
+    if (e.origin.kind === 'plugin') w.submitted.push(e.text)
+    return { text: e.text, ...(e.context ? { context: e.context } : {}) }
+  })
   on('tool.call', async (_$, e) => {
     const call = e as unknown as { tool: string; tool_use_id: string }
     if (call.tool === 'AskUserQuestion') {
@@ -119,11 +165,20 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
   })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* (_$, e) {
+    if (!e.agentId) w.efforts.push(e.effort)
     const toolUses = (e.agentId ? undefined : w.responses.shift()) ?? []
     return { turnId: e.turnId, index: e.index, answer: '', toolUses, stopReason: toolUses.length ? ('tool_use' as const) : ('end_turn' as const), usage: null }
   })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('classic.Stop', () => ({}))
+  on('prompt.attachment', (_$, e) => ({ text: e.text }) as never)
+  on('command.run', (_$, e) => {
+    if (e.command === 'clear' || e.command === 'compact') {
+      w.commands.push(e.command)
+      return { text: '' }
+    }
+    return { text: `no such command: ${e.command}` }
+  })
   const config: Record<string, unknown> = { 'jev.doneCheck': 'shadow' }
   on('config.list', () => ({ value: Object.entries(config).map(([key, value]) => ({ key, value })) as never }))
   on('config.set', (_$, e) => {
@@ -419,6 +474,16 @@ test('/jev-setup checks the key with one call, saves it without it reaching argv
   expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 })
 
+test('/jev-setup switching provider drops the old provider\'s model name', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock, { key: false })
+  w.files[KEY_FILE] = 'JEV_PROVIDER=opencode\nOPENCODE_API_KEY=oc-0123456789abcdef0123\nJEV_MODEL=jev-1.13-free\n'
+  await start($)
+  w.answers.push('Set a new key', 'OpenRouter', 'Read the clipboard')
+  await command($, 'jev-setup')
+  expect(w.files[KEY_FILE]).toBe(`JEV_PROVIDER=openrouter\nOPENCODE_API_KEY=oc-0123456789abcdef0123\nOPENROUTER_API_KEY=${KEY}\n`)
+})
+
 test('/jev-setup with a refused key saves nothing', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock, { key: false })
@@ -609,4 +674,98 @@ test('a reload (no session.start) sets the session up on first use: the key is r
   expect(sent).toMatchObject({ context: [hintText('Read')] })
   expect(logged(w)[0]).toMatchObject({ arm: 'hint', project: 'demo-app' })
   expect(await lines($)).toEqual(['Jev idle', 'routing on'])
+})
+
+test('effort: a quick status question runs at low effort on the same model, and goes back to your effort once it grows', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.85, quick: 0.9 }))
+  await submit($, 'is it in prod?')
+  await $.turn.start({ text: 'is it in prod?', turnId: 'turn-1' })
+  for (let i = 0; i < 10; i++) await step($, 'turn-1', i)
+  await complete($, w, 'turn-1')
+  expect(w.efforts).toEqual([...Array(8).fill('low'), 'xhigh', 'xhigh'])
+  expect(logged(w)[0].triage).toMatchObject({ quick: true, effort: 'status', lowEffort: 'exited' })
+
+  // an ordinary prompt keeps the session's effort
+  await plainTurn($, w, 'implement the export', 'turn-2')
+  expect(w.efforts.at(-1)).toBe('xhigh')
+  expect(logged(w)[1].triage.lowEffort).toBeUndefined()
+})
+
+test('effort in shadow: recorded, never applied', { options: { controlPercent: 0, effort: 'shadow' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.85, quick: 0.9 }))
+  await plainTurn($, w, 'are we done?')
+  expect(w.efforts).toEqual(['xhigh'])
+  expect(logged(w)[0].triage.lowEffort).toBe('shadow')
+})
+
+test('fresh start: a new task in a long conversation is offered /clear, then sent again as yours', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.contextTokens = 180_000
+  w.triage.push(triageAnswer({ newTopic: 0.95, needsEarlier: 0.03 }))
+  w.answers.push('Start fresh (/clear), then send it')
+  const sent = await submit($, 'ok, another subject: draft the newsletter')
+  expect(sent).toMatchObject({ drop: expect.stringContaining('clearing the conversation') })
+  await clock.advance(50)
+  await settle(() => w.submitted.length > 0 || w.toasts.length > 0)
+  expect(w.toasts).toEqual([])
+  expect(w.commands).toEqual(['clear'])
+  expect(w.submitted).toEqual(['ok, another subject: draft the newsletter'])
+})
+
+test('fresh start: kept when declined, and never offered for a short conversation or a follow-up', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.contextTokens = 180_000
+  w.triage.push(triageAnswer({ newTopic: 0.95, needsEarlier: 0.03 }))
+  w.answers.push('Keep the conversation')
+  await plainTurn($, w, 'another subject: the invoices')
+  expect(logged(w)[0].triage.fresh).toBe('kept')
+  // a follow-up needs the conversation: not offered
+  w.triage.push(triageAnswer({ newTopic: 0.95, needsEarlier: 0.4 }))
+  await plainTurn($, w, 'and the same for March', 'turn-2')
+  // a short conversation: not worth it
+  w.contextTokens = 30_000
+  w.triage.push(triageAnswer({ newTopic: 0.97, needsEarlier: 0.01 }))
+  await plainTurn($, w, 'unrelated: what time is it in Tokyo?', 'turn-3')
+  expect(w.commands).toEqual([])
+  expect(logged(w).map(r => r.triage.fresh)).toEqual(['kept', undefined, undefined])
+})
+
+const LISTING = ['- deploy: Ship the app to Railway and check it.', '- generate-image: Make pictures', '  with a local server.', '- review: Review the diff for bugs.', '- translate-book: Translate scanned Japanese books.'].join('\n')
+
+test('skill gate: skills the project will not need keep only their name, the same for the whole session', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.files['/Users/me/repo/demo-app/README.md'] = '# demo-app\nA Next.js app deployed on Railway.'
+  w.skillAnswer = i => [0.9, 0.1, 0.8, 0.05][i]!
+  await start($)
+  const first = await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
+  expect(first.text).toBe(['- deploy: Ship the app to Railway and check it.', '- generate-image', '- review: Review the diff for bugs.', '- translate-book'].join('\n'))
+  expect(w.skillAsks[0]!.state.conversation[0]!.text).toContain('A Next.js app deployed on Railway.')
+  // a later render of the listing: the same decision, no new call
+  const again = await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
+  expect(again.text).toBe(first.text)
+  expect(w.skillAsks).toHaveLength(1)
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /skill list \d+ → \d+ tokens per request · 2 of 4 kept whole/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('skill gate in shadow, or without an answer from Jev: the listing is left whole', { options: { controlPercent: 0, skillGate: 'shadow' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.skillAnswer = () => 0.05
+  await start($)
+  const out = await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
+  expect(out.text).toBe(LISTING)
+  expect(w.skillAsks).toHaveLength(1)
 })

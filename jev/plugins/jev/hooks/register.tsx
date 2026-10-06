@@ -12,6 +12,16 @@ import {
   cardFor,
   cleanPrompt,
   DONE_NUDGE,
+  JEV_TIMEOUT_MS as ASK_TIMEOUT_MS,
+  LOW_EFFORT_STEPS,
+  TOPIC_MIN_TOKENS,
+  TRIAGE_QUESTIONS,
+  approxTokens,
+  gateListing,
+  parseSkillListing,
+  skillQuestions,
+  skillsToTrim,
+  triage as triageOf,
   DONE_QUESTIONS,
   decide,
   doneText,
@@ -46,7 +56,7 @@ import {
   turnsFrom,
   upsertEnv,
 } from './logic'
-import type { Answer, Arm, Decision, DoneCheck, Spend, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
+import type { Answer, Arm, Decision, DoneCheck, Spend, Triage, JevAccess, JevState, JevTurn, LogRecord, MessageRow, Provider, Question, Tool, TurnRecord } from './logic'
 import { ANIMATED, ANSWER_FRAMES, SCENE_ROWS, STILL, rasterCells, scenePixels } from './sprites'
 import type { Card, Scene, SceneState } from './sprites'
 
@@ -61,6 +71,7 @@ const phase = atom({ plugin: 'jev', key: 'phase' } as const, null)
 const decision = atom({ plugin: 'jev', key: 'decision' } as const, null)
 const original = atom({ plugin: 'jev', key: 'original' } as const, { saved: false, value: null })
 const weekView = atom({ plugin: 'jev', key: 'week' } as const, null)
+const skillView = atom({ plugin: 'jev', key: 'skills' } as const, null)
 /** The window the pane's summary covers. */
 const WEEK_DAYS = 7
 
@@ -95,6 +106,8 @@ type Turn = {
   before?: Usage
   /** The done check at the turn's last stop, while it runs and once it is in. */
   done?: Promise<DoneCheck | undefined>
+  /** What Jev made of the prompt (effort, topic) and what the mod did with it. */
+  triage?: NonNullable<TurnRecord['triage']>
 }
 
 /** The session's cost so far (US dollars, API prices) and the weekly quota used (percent). */
@@ -114,6 +127,9 @@ async function usageNow($: $): Promise<Usage> {
 let mode: 'on' | 'shadow' | 'off' = 'on'
 let controlPercent = 20
 let doneMode: 'shadow' | 'on' | 'off' = 'shadow'
+let effortMode: 'on' | 'shadow' | 'off' = 'on'
+let skillMode: 'on' | 'shadow' | 'off' = 'on'
+let topicMode: 'ask' | 'off' = 'ask'
 let excludedRepos = ''
 
 // The session's facts, worked out at session.start (which a reload fires again).
@@ -127,7 +143,9 @@ let access: JevAccess | undefined
 const turns = new Map<string, Turn>()
 let current: string | undefined
 /** What prompt.submit settled for the turn about to start: its arm, and Jev's first answer. */
-let opening: { arm: Turn['arm']; jev: JevTurn; pending?: string } | undefined
+let opening: { arm: Turn['arm']; jev: JevTurn; pending?: string; triage?: NonNullable<TurnRecord['triage']> } | undefined
+/** A fresh start the person chose: recorded on the turn their re-sent prompt opens. */
+let freshChosen: 'clear' | 'compact' | undefined
 let writing: Promise<void> = Promise.resolve()
 
 // The animation: when the last tool call started (for the spark), the band's site, the timer.
@@ -238,6 +256,9 @@ async function configure($: $, cwd: string): Promise<void> {
     ...(gateway ? { gateway } : {}),
     ...(before.paused ? { paused: true } : {}),
     doneCheck: doneMode,
+    effort: effortMode,
+    skillGate: skillMode,
+    freshStart: topicMode,
   }))
 }
 
@@ -336,6 +357,91 @@ async function consult($: $, jev: JevTurn, arm: JevArm, rows: readonly MessageRo
     ...(arm === 'shadow' ? { shadow: true } : {}),
   }))
   return d
+}
+
+// ------------------------------------------------------------ triage: effort and fresh starts
+
+/** One Jev call about the prompt: how much reasoning it needs, and whether it opens a new task. */
+async function runTriage($: $, rows: readonly MessageRow[]): Promise<Triage | undefined> {
+  const a = access
+  if (!a) return undefined
+  const work = askJev($, a, buildState(turnsFrom(rows)), TRIAGE_QUESTIONS).then(triageOf, () => undefined)
+  return within($, work, ASK_TIMEOUT_MS)
+}
+
+/** How big the conversation is now, in tokens (what every request re-reads). */
+async function contextTokens($: $): Promise<number> {
+  try {
+    return (await $.session.usage()).context.tokens ?? 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Runs /clear or /compact, then sends the person's prompt again, as theirs. A command cannot run
+ * from inside the prompt's own hook (it would wait on the prompt being held), so it starts from a
+ * timer once that hook has returned.
+ */
+function freshStart($: $, how: 'clear' | 'compact', text: string): void {
+  const timer = $.clock.every(50, async () => {
+    timer.cancel()
+    try {
+      freshChosen = how
+      await $.command.run({ command: how, args: '' })
+      await $.prompt.submit({ text, asUser: true })
+    } catch (error) {
+      freshChosen = undefined
+      $.ui.toast(`Jev: could not ${how} (${message(error)}); your prompt was not sent, so send it again.`)
+    }
+  })
+}
+
+const FRESH_OPTIONS = { clear: 'Start fresh (/clear), then send it', compact: 'Compact first (/compact), then send it', keep: 'Keep the conversation' } as const
+
+// ------------------------------------------------------------ the skill gate
+
+type SkillGate = { session: string; mode: 'on' | 'shadow'; trim: string[]; count: number; before: number; after: number }
+
+/** What the session's project is about, for Jev to judge which skills it needs. */
+async function projectSignals($: $): Promise<string> {
+  const head = async (file: string) => {
+    try {
+      return (await $.fs.read(`${sessionCwd}/${file}`)).slice(0, 1500)
+    } catch {
+      return ''
+    }
+  }
+  let names = ''
+  try {
+    names = (await $.fs.list(sessionCwd)).map(e => e.name).filter(n => !n.startsWith('.')).slice(0, 40).join(', ')
+  } catch {
+    // an unreadable folder: the name and the files below say enough
+  }
+  const claude = await head('CLAUDE.md')
+  const readme = await head('README.md')
+  return [`Project folder: ${project}`, names ? `Files: ${names}` : '', claude ? `CLAUDE.md:\n${claude}` : '', readme ? `README.md:\n${readme}` : ''].filter(Boolean).join('\n\n')
+}
+
+/**
+ * Decides, once per session, which skills keep their description in the listing Claude reads on
+ * every request. Kept in state so the listing stays the same for the whole session (the prompt
+ * cache depends on it), across reloads too. Undefined when Jev could not judge: the listing stays whole.
+ */
+async function decideSkills($: $, listing: NonNullable<ReturnType<typeof parseSkillListing>>): Promise<SkillGate | undefined> {
+  const known = await read($, skillView)
+  if (known && known.session === sessionId) return known
+  const a = access
+  if (!a || skillMode === 'off') return undefined
+  const state: JevState = { conversation: [{ role: 'user', text: await projectSignals($) }] }
+  const answers = await within($, askJev($, a, state, skillQuestions(listing.entries)).catch(() => undefined), ASK_TIMEOUT_MS + 2000)
+  if (!answers) return undefined
+  const trim = skillsToTrim(listing.entries, answers)
+  const whole = gateListing(listing, new Set())
+  const gated = gateListing(listing, new Set(trim))
+  const gate: SkillGate = { session: sessionId, mode: skillMode === 'on' ? 'on' : 'shadow', trim, count: listing.entries.length, before: approxTokens(whole), after: approxTokens(gated) }
+  await update($, skillView, () => gate)
+  return gate
 }
 
 // ------------------------------------------------------------ the done check
@@ -574,6 +680,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
     },
     ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
     ...(done ? { done } : {}),
+    ...(turn.triage ? { triage: turn.triage } : {}),
   }
   await log($, record)
   await publish($, record)
@@ -674,6 +781,8 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
     </Box>
   )
   const now = await sceneOf($)
+  const skills = await read($, skillView)
+  const sessionIdNow = sessionId
   const usage = await usageNow($)
   const week = await read($, weekView)
   const lj = last?.jev
@@ -696,12 +805,26 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         </Text>
       ) : null}
       {ready ? (
-        <Text wrap="truncate-end">
-          <Text dimColor>done check  </Text>
-          <Text color={(s.doneCheck ?? doneMode) === 'on' ? 'cyan' : undefined} dimColor={(s.doneCheck ?? doneMode) === 'off'}>
-            {DONE_MODE_TEXT[s.doneCheck ?? doneMode]}
-          </Text>
-        </Text>
+        <Box flexDirection="column">
+          {(Object.keys(SWITCHES) as SwitchKey[]).map(key => {
+            const value = switchValue(key)
+            const text: Record<string, string> = SWITCHES[key].text
+            return (
+              <Text key={`switch-${key}`} wrap="truncate-end">
+                <Text dimColor>{SWITCHES[key].label.padEnd(13)}</Text>
+                <Text color={value === 'on' || value === 'ask' ? 'cyan' : undefined} dimColor={value === 'off'}>
+                  {text[value]}
+                </Text>
+              </Text>
+            )
+          })}
+          {skills && skills.session === sessionIdNow ? (
+            <Text wrap="truncate-end" dimColor>
+              {'             '}skill list {tokens(skills.before)} → {tokens(skills.after)} tokens per request · {skills.count - skills.trim.length} of {skills.count} kept whole
+              {skills.mode === 'shadow' ? ' (shadow)' : ''}
+            </Text>
+          ) : null}
+        </Box>
       ) : null}
       {s.gateway ? (
         <Text color="yellow" wrap="wrap">
@@ -864,7 +987,11 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
         {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
         {ready ? <Button key="pause" hotkey="p" plain label={s.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !s.paused)} /> : null}
-        {ready ? <Button key="done" hotkey="d" plain label={`done check: ${DONE_NEXT[s.doneCheck ?? doneMode]}`} onPress={() => cycleDoneCheck($)} /> : null}
+        {ready
+          ? (Object.keys(SWITCHES) as SwitchKey[]).map(key => (
+              <Button key={key === 'doneCheck' ? 'done' : key} hotkey={SWITCHES[key].hotkey} plain label={`${SWITCHES[key].label}: ${nextValue(key)}`} onPress={() => cycleSwitch($, key)} />
+            ))
+          : null}
         {/* the terminal's pane has its own ✕ */}
         {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
@@ -872,29 +999,68 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   )
 }
 
-const DONE_NEXT = { shadow: 'on', on: 'off', off: 'shadow' } as const
-const DONE_MODE_TEXT = {
-  shadow: 'shadow · broken promises are only recorded',
-  on: 'on · Claude is sent back to work',
-  off: 'off · stops are not checked',
+/** The pane's switches: each one a /config option, cycled in this order. */
+const SWITCHES = {
+  doneCheck: {
+    label: 'done check',
+    hotkey: 'd',
+    order: ['shadow', 'on', 'off'],
+    text: { shadow: 'shadow · broken promises are only recorded', on: 'on · Claude is sent back to work', off: 'off · stops are not checked' },
+  },
+  effort: {
+    label: 'effort',
+    hotkey: 'e',
+    order: ['on', 'shadow', 'off'],
+    text: { on: 'on · quick status questions run at low effort', shadow: 'shadow · recorded only', off: 'off · your effort always' },
+  },
+  skillGate: {
+    label: 'skill gate',
+    hotkey: 'k',
+    order: ['on', 'shadow', 'off'],
+    text: { on: "on · skills this project won't need keep only their name", shadow: 'shadow · recorded only', off: 'off · the full skill list' },
+  },
+  freshStart: {
+    label: 'fresh start',
+    hotkey: 't',
+    order: ['ask', 'off'],
+    text: { ask: 'ask · offer /clear when a new task starts in a long conversation', off: 'off · never asks' },
+  },
 } as const
+type SwitchKey = keyof typeof SWITCHES
 
-/** Moves the done check to its next mode, saved in /config like the menu would. */
-async function cycleDoneCheck($: $): Promise<void> {
-  const value = DONE_NEXT[doneMode]
+function switchValue(key: SwitchKey): string {
+  return { doneCheck: doneMode, effort: effortMode, skillGate: skillMode, freshStart: topicMode }[key]
+}
+
+function setSwitch(key: SwitchKey, value: string): void {
+  if (key === 'doneCheck') doneMode = value as typeof doneMode
+  else if (key === 'effort') effortMode = value as typeof effortMode
+  else if (key === 'skillGate') skillMode = value as typeof skillMode
+  else topicMode = value as typeof topicMode
+}
+
+function nextValue(key: SwitchKey): string {
+  const order: readonly string[] = SWITCHES[key].order
+  return order[(order.indexOf(switchValue(key)) + 1) % order.length]!
+}
+
+/** Moves a switch to its next value, saved in /config like the menu would. */
+async function cycleSwitch($: $, key: SwitchKey): Promise<void> {
+  const value = nextValue(key)
+  const label = SWITCHES[key].label
   try {
-    const row = (await $.config.list()).find(r => r.key.endsWith('.doneCheck') && r.key.startsWith('jev'))
+    const row = (await $.config.list()).find(r => r.key.endsWith(`.${key}`) && r.key.startsWith('jev'))
     const written = row ? await $.config.set({ key: row.key, value }) : { deny: 'the option is not in /config' }
     if (written.deny !== undefined) {
-      $.ui.toast(`Jev: the done check stays ${doneMode} (${written.deny}).`)
+      $.ui.toast(`Jev: the ${label} stays ${switchValue(key)} (${written.deny}).`)
       return
     }
   } catch (error) {
-    $.ui.toast(`Jev: the done check stays ${doneMode} (${message(error)}).`)
+    $.ui.toast(`Jev: the ${label} stays ${switchValue(key)} (${message(error)}).`)
     return
   }
-  doneMode = value
-  await update($, status, s => ({ ...s, doneCheck: value }))
+  setSwitch(key, value)
+  await update($, status, s => ({ ...s, [key]: value }))
 }
 
 /** `Mon 14:00` for a reset time. */
@@ -963,7 +1129,9 @@ async function saveKey($: $, provider: Provider, key: string, model?: string): P
   } catch {
     // a new file
   }
-  await $.fs.write(path, upsertEnv(text, { JEV_PROVIDER: provider, [PROVIDERS[provider].keyEnv]: key, ...(model ? { JEV_MODEL: model } : {}) }))
+  // A model id belongs to one provider: a new key without one drops the old provider's.
+  const kept = model ? text : text.replace(/^\s*(export\s+)?JEV_MODEL\s*=.*\n?/gm, '')
+  await $.fs.write(path, upsertEnv(kept, { JEV_PROVIDER: provider, [PROVIDERS[provider].keyEnv]: key, ...(model ? { JEV_MODEL: model } : {}) }))
   // No chmod on Windows: the file sits in the user's own profile there.
   await $.process.run(['chmod', '600', path], { timeoutMs: 5000 }).catch(() => undefined)
 }
@@ -1027,6 +1195,9 @@ async function setup($: $, cwd: string): Promise<string> {
 export const register: Register = (on, options) => {
   mode = options.mode === 'off' || options.mode === 'shadow' ? options.mode : 'on'
   doneMode = options.doneCheck === 'on' || options.doneCheck === 'off' ? options.doneCheck : 'shadow'
+  effortMode = options.effort === 'shadow' || options.effort === 'off' ? options.effort : 'on'
+  skillMode = options.skillGate === 'shadow' || options.skillGate === 'off' ? options.skillGate : 'on'
+  topicMode = options.freshStart === 'off' ? 'off' : 'ask'
   controlPercent = typeof options.controlPercent === 'number' && options.controlPercent >= 0 && options.controlPercent <= 100 ? options.controlPercent : 20
   excludedRepos = typeof options.excludedRepos === 'string' ? options.excludedRepos : ''
 
@@ -1045,15 +1216,55 @@ export const register: Register = (on, options) => {
     await ensureSession($)
     // A prompt delivered into a running turn is not a new turn's.
     if (e.turnId || !tracked()) return next(e)
-    const arm = armFor((await read($, status)).paused === true)
+    const paused = (await read($, status)).paused === true
+    const arm = armFor(paused)
     const o: NonNullable<typeof opening> = { arm, jev: emptyJevTurn() }
     opening = o
-    if ((arm !== 'hint' && arm !== 'shadow') || e.text.trimStart().startsWith('/')) return next(e)
+    const fresh = freshChosen
+    freshChosen = undefined
+    if (e.text.trimStart().startsWith('/') || excluded || paused || !access) return next(e)
     const rows: MessageRow[] = [...(await conversationRows($)), { role: 'user', text: e.text, toolUses: [] }]
-    const d = await consult($, o.jev, arm, rows)
-    if (d.mode !== 'hint' || !d.tool) return next(e)
+    // The prompt's triage runs beside the hint ask, so it adds no wait of its own.
+    const triaged = effortMode !== 'off' || topicMode !== 'off' ? runTriage($, rows) : Promise.resolve(undefined)
+    const hinted = arm === 'hint' || arm === 'shadow' ? consult($, o.jev, arm, rows) : Promise.resolve(undefined)
+    const [t, d] = await Promise.all([triaged, hinted])
+    if (!t && fresh) o.triage = { quick: false, newTopic: false, fresh }
+    if (t) {
+      o.triage = { ...t, ...(t.quick && effortMode !== 'off' ? { lowEffort: effortMode === 'on' ? 'applied' : 'shadow' } : {}), ...(fresh ? { fresh } : {}) }
+      // A new, self-contained task in a long conversation: offer to start fresh instead of re-reading it all.
+      if (t.newTopic && !fresh && topicMode === 'ask' && !e.attachments?.length) {
+        const size = await contextTokens($)
+        if (size >= TOPIC_MIN_TOKENS) {
+          const choice = await ask(
+            $,
+            `This looks like a new task that needs nothing from this conversation. Every request re-reads the ${tokens(size)} tokens it holds now. Start fresh?`,
+            Object.values(FRESH_OPTIONS),
+            'New task',
+          )
+          const how = choice === FRESH_OPTIONS.clear ? 'clear' : choice === FRESH_OPTIONS.compact ? 'compact' : undefined
+          if (how) {
+            opening = undefined
+            freshStart($, how, e.text)
+            return { drop: `Jev: ${how === 'clear' ? 'clearing the conversation' : 'compacting the conversation'}, then sending your prompt again.` }
+          }
+          o.triage.fresh = choice === FRESH_OPTIONS.keep ? 'kept' : 'dismissed'
+        }
+      }
+    }
+    if (!d || d.mode !== 'hint' || !d.tool) return next(e)
     o.pending = d.tool
     return arm === 'hint' ? next({ ...e, context: [...(e.context ?? []), hintText(d.tool)] }) : next(e)
+  })
+
+  // The skill listing Claude reads on every request: skills the project is unlikely to need keep only their name.
+  on('prompt.attachment', { type: 'skill_listing' }, async ($, e, next) => {
+    await ensureSession($)
+    if (skillMode === 'off' || excluded || !access) return next(e)
+    const listing = parseSkillListing(e.text)
+    if (!listing) return next(e)
+    const gate = await decideSkills($, listing)
+    if (!gate || gate.mode !== 'on' || gate.trim.length === 0) return next(e)
+    return next({ ...e, text: gateListing(listing, new Set(gate.trim)) })
   })
 
   on('turn.start', async ($, e, next) => {
@@ -1061,7 +1272,7 @@ export const register: Register = (on, options) => {
     if (tracked()) {
       const o = opening ?? { arm: armFor((await read($, status)).paused === true), jev: emptyJevTurn() }
       opening = undefined
-      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}), before: await usageNow($) })
+      turns.set(e.turnId, { prompt: e.text, arm: o.arm, steps: 0, tools: 0, jev: o.jev, ...(o.pending ? { pending: o.pending } : {}), ...(o.triage ? { triage: o.triage } : {}), before: await usageNow($) })
       current = e.turnId
     }
     return next(e)
@@ -1076,9 +1287,15 @@ export const register: Register = (on, options) => {
     const step: Step = { done: new Promise<number>(r => (settle = r)), finished: 0, results: {} }
     turn.step = step
     if (turn.arm !== 'excluded') await enter($, 'thinking', turn.arm)
+    // A quick status question runs at low effort; the same model, and back to the session's effort once it grows.
+    let request = e
+    if (turn.triage?.lowEffort === 'applied' && e.effort !== undefined) {
+      if (turn.steps <= LOW_EFFORT_STEPS) request = { ...e, effort: 'low' }
+      else turn.triage.lowEffort = 'exited'
+    }
     let calls = -1
     try {
-      const result = yield* next(e)
+      const result = yield* next(request)
       calls = result.toolUses.length
       // Did Claude call the tool Jev pointed at (hinted, or would have in shadow)?
       if (turn.pending && result.toolUses.some(u => u.name === turn.pending)) turn.jev.followed++
