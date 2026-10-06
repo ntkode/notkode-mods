@@ -43,8 +43,8 @@ import {
   normalizeAnswers,
   parseEnvFile,
   parseLog,
-  pickArm,
   reasonText,
+  board as boardOf,
   report,
   shortlistQuestions,
   shortlisted,
@@ -70,7 +70,7 @@ const sessionView = atom({ plugin: 'jev', key: 'session' } as const, EMPTY_SESSI
 const phase = atom({ plugin: 'jev', key: 'phase' } as const, null)
 const decision = atom({ plugin: 'jev', key: 'decision' } as const, null)
 const original = atom({ plugin: 'jev', key: 'original' } as const, { saved: false, value: null })
-const weekView = atom({ plugin: 'jev', key: 'week' } as const, null)
+const boardView = atom({ plugin: 'jev', key: 'board' } as const, null)
 const skillView = atom({ plugin: 'jev', key: 'skills' } as const, null)
 /** The window the pane's summary covers. */
 const WEEK_DAYS = 7
@@ -126,7 +126,7 @@ async function usageNow($: $): Promise<Usage> {
 // The options, read at each load.
 let mode: 'on' | 'shadow' | 'off' = 'on'
 let controlPercent = 20
-let doneMode: 'shadow' | 'on' | 'off' = 'shadow'
+let doneMode: 'shadow' | 'on' | 'off' = 'off'
 let effortMode: 'on' | 'shadow' | 'off' = 'on'
 let skillMode: 'on' | 'shadow' | 'off' = 'on'
 let topicMode: 'ask' | 'off' = 'ask'
@@ -146,6 +146,9 @@ let current: string | undefined
 let opening: { arm: Turn['arm']; jev: JevTurn; pending?: string; triage?: NonNullable<TurnRecord['triage']> } | undefined
 /** A fresh start the person chose: recorded on the turn their re-sent prompt opens. */
 let freshChosen: 'clear' | 'compact' | undefined
+/** The context's size when a fresh start was chosen, and what it dropped (tokens every later request no longer re-reads). */
+let freshFrom = 0
+let freshDropped = 0
 let writing: Promise<void> = Promise.resolve()
 
 // The animation: when the last tool call started (for the spark), the band's site, the timer.
@@ -186,6 +189,7 @@ function ensureSession($: $, cwd?: string): Promise<void> {
 }
 
 async function startSession($: $, cwd?: string): Promise<void> {
+  freshDropped = 0
   sessionCwd = cwd ?? (await $.session.cwd())
   project = folderName(sessionCwd)
   home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
@@ -243,35 +247,42 @@ async function undoGatewayRouting($: $): Promise<void> {
   await $.env.set('ANTHROPIC_BASE_URL', before)
 }
 
+/** The features' switches as the status records them. */
+function switchStatus(): { doneCheck: 'on' | 'off'; effort: 'on' | 'off'; skillGate: 'on' | 'off'; freshStart: 'on' | 'off' } {
+  const v = (on: boolean) => (on ? 'on' : 'off') as 'on' | 'off'
+  return { doneCheck: v(doneMode === 'on'), effort: v(effortMode !== 'off'), skillGate: v(skillMode !== 'off'), freshStart: v(topicMode !== 'off') }
+}
+
 /** Works out whether Jev can be asked here, from the options, the folder and the key. */
 async function configure($: $, cwd: string): Promise<void> {
   excluded = isExcluded(cwd, excludedRepos)
-  access = mode === 'off' || excluded ? undefined : await loadAccess($)
+  access = excluded ? undefined : await loadAccess($)
   const gateway = localGatewayOrigin(await $.env.get('ANTHROPIC_BASE_URL'))
-  const state: JevReadiness = mode === 'off' ? 'off' : excluded ? 'excluded' : access ? 'ready' : 'no_key'
+  const state: JevReadiness = excluded ? 'excluded' : access ? 'ready' : 'no_key'
   await update($, status, before => ({
     state,
     mode,
     ...(access ? { provider: PROVIDERS[access.provider].label } : {}),
     ...(gateway ? { gateway } : {}),
     ...(before.paused ? { paused: true } : {}),
-    doneCheck: doneMode,
-    effort: effortMode,
-    skillGate: skillMode,
-    freshStart: topicMode,
+    ...switchStatus(),
   }))
 }
 
-/** Turns are followed (logged, counted) when Jev could be asked, and in excluded repos for the record. */
+/** Turns are followed (logged, counted) when Jev can be asked, and in excluded repos for the record. */
 function tracked(): boolean {
-  return mode !== 'off' && (excluded || access !== undefined)
+  return excluded || access !== undefined
 }
 
-/** How the next turn is run: excluded, paused (off), or drawn between hints and control (or shadow). */
+/**
+ * How the next turn is run. Control turns (a random share) run with no Jev feature at all, the
+ * baseline every feature's saving is measured against; the rest get hints when hints are on.
+ */
 function armFor(paused: boolean): Turn['arm'] {
   if (excluded) return 'excluded'
   if (paused || !access) return 'off'
-  return pickArm(mode === 'shadow' ? 'shadow' : 'on', controlPercent, roll())
+  if (roll() * 100 < controlPercent) return 'control'
+  return mode === 'on' ? 'hint' : mode === 'shadow' ? 'shadow' : 'off'
 }
 
 // ------------------------------------------------------------ asking Jev
@@ -535,6 +546,7 @@ async function enter($: $, name: 'thinking' | 'working' | null, arm: JevArm = 'h
 /** The standing setting, under the band's status line. */
 function routingText(s: { mode: string; paused?: boolean }, arm?: JevArm): string {
   if (s.paused) return 'routing paused for this session'
+  if (s.mode === 'off') return arm === 'control' ? 'control turn · no Jev' : 'hints off'
   if (s.mode === 'shadow') return 'routing in shadow · Claude sees no hints'
   if (arm === 'control') return 'routing on · control turn, no hints'
   return 'routing on'
@@ -653,6 +665,10 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
   const done = turn.done ? await within($, turn.done, JEV_TIMEOUT_MS + 1000) : undefined
   const after = await usageNow($)
   const before = turn.before ?? {}
+  // What the features took off every request: the skill gate's trim, and an earlier fresh start.
+  if (turn.triage?.fresh === 'clear' || turn.triage?.fresh === 'compact') freshDropped = Math.max(0, freshFrom - (await contextTokens($)))
+  const gate = await read($, skillView)
+  const skillsSaved = gate && gate.session === sessionId && gate.mode === 'on' ? gate.before - gate.after : 0
   const delta = (a?: number, b?: number) => (a !== undefined && b !== undefined ? Math.max(0, Math.round((a - b) * 1e6) / 1e6) : undefined)
   const usd = delta(after.usd, before.usd)
   const weekPct = delta(after.week, before.week)
@@ -681,6 +697,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
     ...(turn.jev.asked > 0 ? { jev: turn.jev } : {}),
     ...(done ? { done } : {}),
     ...(turn.triage ? { triage: turn.triage } : {}),
+    ...(skillsSaved > 0 || freshDropped > 0 ? { saved: { ...(skillsSaved > 0 ? { skills: skillsSaved } : {}), ...(freshDropped > 0 ? { fresh: freshDropped } : {}) } } : {}),
   }
   await log($, record)
   await publish($, record)
@@ -689,8 +706,8 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
 
 /** The last days from the log, for the pane: what Jev answered, hints vs control, spend, savings. */
 async function refreshWeek($: $): Promise<void> {
-  const lines = report(await readLogs($, WEEK_DAYS), WEEK_DAYS).split('\n')
-  await update($, weekView, () => lines)
+  const b = boardOf(await readLogs($, WEEK_DAYS), WEEK_DAYS)
+  await update($, boardView, () => b)
 }
 
 /** Feeds the pane (the turn just logged, the session's totals) and returns the band to rest. */
@@ -742,325 +759,139 @@ async function publish($: $, record: TurnRecord): Promise<void> {
 // ------------------------------------------------------------ the pane
 
 const STATE_TEXT: Record<string, { text: string; color: string }> = {
-  off: { text: 'off', color: 'gray' },
   no_key: { text: 'needs a key', color: 'yellow' },
   ready: { text: 'ready', color: 'green' },
   excluded: { text: 'off in this repo', color: 'gray' },
 }
 
-/** One cell per time Jev was asked: what it answered. */
-const CARD_CELL: Record<string, { cell: string; color?: string; dim?: boolean }> = {
-  pick: { cell: '■', color: 'cyan' },
-  pass: { cell: '·', dim: true },
-  fail: { cell: '×', color: 'red' },
+/** The pane's switches: each feature on or off, saved in /config, in board order. */
+const SWITCHES = {
+  hints: { config: 'mode', label: 'hints', hotkey: 'h' },
+  effort: { config: 'effort', label: 'effort', hotkey: 'e' },
+  skillGate: { config: 'skillGate', label: 'skill gate', hotkey: 'k' },
+  freshStart: { config: 'freshStart', label: 'fresh start', hotkey: 't' },
+  doneCheck: { config: 'doneCheck', label: 'done check', hotkey: 'd' },
+} as const
+type SwitchKey = keyof typeof SWITCHES
+
+function isOn(key: SwitchKey): boolean {
+  return { hints: mode !== 'off', effort: effortMode !== 'off', skillGate: skillMode !== 'off', freshStart: topicMode !== 'off', doneCheck: doneMode === 'on' }[key]
 }
 
-const ARM_TEXT: Record<JevTurnView['arm'], string | undefined> = {
-  hint: undefined,
-  control: 'control turn: Jev sat it out, to compare with',
-  shadow: 'shadow: Jev was asked, Claude saw none of it',
-  excluded: 'excluded repo: Jev was not asked',
-  off: 'paused: Jev was not asked',
+function setSwitch(key: SwitchKey, on: boolean): void {
+  if (key === 'hints') mode = on ? 'on' : 'off'
+  else if (key === 'effort') effortMode = on ? 'on' : 'off'
+  else if (key === 'skillGate') skillMode = on ? 'on' : 'off'
+  else if (key === 'freshStart') topicMode = on ? 'ask' : 'off'
+  else doneMode = on ? 'on' : 'off'
+}
+
+/** Turns a feature on or off, saved in /config like the menu would. */
+async function toggle($: $, key: SwitchKey): Promise<void> {
+  const on = !isOn(key)
+  const { config, label } = SWITCHES[key]
+  try {
+    const row = (await $.config.list()).find(r => r.key.endsWith(`.${config}`) && r.key.startsWith('jev'))
+    const written = row ? await $.config.set({ key: row.key, value: on ? 'on' : 'off' }) : { deny: 'the option is not in /config' }
+    if (written.deny !== undefined) {
+      $.ui.toast(`Jev: ${label} stays ${on ? 'off' : 'on'} (${written.deny}).`)
+      return
+    }
+  } catch (error) {
+    $.ui.toast(`Jev: ${label} stays ${on ? 'off' : 'on'} (${message(error)}).`)
+    return
+  }
+  setSwitch(key, on)
+  // Rearm the turn drawing: hints on or off changes how the next turn is run.
+  await update($, status, s => ({ ...s, mode, ...switchStatus() }))
+}
+
+/** `+1.2%`, `-0.4%`, `<0.1%`. */
+function quotaPct(p: number): string {
+  if (Math.abs(p) < 0.05) return p >= 0 ? '<0.1%' : '>-0.1%'
+  return `${p > 0 ? '+' : ''}${p.toFixed(1)}%`
 }
 
 async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const s = await read($, status)
-  const last = await read($, lastView)
-  const step = await read($, phase)
-  const d = await read($, decision)
-  const session = { ...EMPTY_SESSION, ...(await read($, sessionView)) }
+  const b = await read($, boardView)
+  const usage = await usageNow($)
   const state = STATE_TEXT[s.state] ?? { text: s.state, color: 'gray' }
   const ready = s.state === 'ready'
-  const pct = (n: number, of: number) => (of > 0 ? ` (${Math.round((n / of) * 100)}%)` : '')
-  const label = (text: string) => <Text dimColor>{text.padEnd(16)}</Text>
-  const tile = (value: string, name: string, color?: string) => (
-    <Box flexDirection="column" marginRight={3}>
-      <Text bold color={color}>{value}</Text>
-      <Text dimColor>{name}</Text>
-    </Box>
-  )
-  const now = await sceneOf($)
-  const skills = await read($, skillView)
-  const sessionIdNow = sessionId
-  const usage = await usageNow($)
-  const week = await read($, weekView)
-  const lj = last?.jev
-  const sessionJev = session.jevMs.length ? median(session.jevMs) : undefined
+  const keys = Object.keys(SWITCHES) as SwitchKey[]
 
   return (
     <Box flexDirection="column">
-      {/* where things stand */}
       <Box flexDirection="row" justifyContent="space-between">
         <Text>
           <Text bold>Jev</Text>
           <Text color={state.color}>  ● {state.text}</Text>
-          {ready ? <Text color={s.paused ? 'yellow' : 'cyan'}>  {routingText(s)}</Text> : null}
         </Text>
         <Text dimColor>{s.provider ?? ''}</Text>
       </Box>
-      {ready ? (
-        <Text dimColor wrap="truncate-end">
-          asked before each of Claude's requests · hints at ≥ 0.7 · {controlPercent}% control turns
-        </Text>
-      ) : null}
-      {ready ? (
-        <Box flexDirection="column">
-          {(Object.keys(SWITCHES) as SwitchKey[]).map(key => {
-            const value = switchValue(key)
-            const text: Record<string, string> = SWITCHES[key].text
-            return (
-              <Text key={`switch-${key}`} wrap="truncate-end">
-                <Text dimColor>{SWITCHES[key].label.padEnd(13)}</Text>
-                <Text color={value === 'on' || value === 'ask' ? 'cyan' : undefined} dimColor={value === 'off'}>
-                  {text[value]}
-                </Text>
-              </Text>
-            )
-          })}
-          {skills && skills.session === sessionIdNow ? (
-            <Text wrap="truncate-end" dimColor>
-              {'             '}skill list {tokens(skills.before)} → {tokens(skills.after)} tokens per request · {skills.count - skills.trim.length} of {skills.count} kept whole
-              {skills.mode === 'shadow' ? ' (shadow)' : ''}
-            </Text>
-          ) : null}
-        </Box>
-      ) : null}
-      {s.gateway ? (
-        <Text color="yellow" wrap="wrap">
-          This session's requests go through a local proxy ({s.gateway}). If it is jev-gateway, it hints too: run one or the other to measure either.
-        </Text>
-      ) : null}
+      {s.state === 'no_key' ? <Text color="yellow">Run /jev-setup (or press s) to add a key for Jev.</Text> : null}
 
-      {/* the turn running now */}
-      {step ? (
-        <Box marginTop={1}>
-          <Text wrap="truncate-end">
-            <Text color="yellow">▶ now  </Text>
-            {nowLine($, e, now.scene, d, now.shadow, step.tool, s.paused)}
-          </Text>
-        </Box>
-      ) : null}
-
-      {/* the last turn */}
+      {/* each feature: on or off, and what it saved of the weekly quota */}
       <Box marginTop={1} flexDirection="column">
         <Text>
-          <Text bold>Last turn</Text>
-          {last ? (
-            <Text dimColor>
-              {'  '}
-              {duration(last.durationMs)} · {last.steps} requests{last.output !== undefined ? ` · ${tokens(last.output)} out` : ''}
-            </Text>
-          ) : null}
+          <Text bold>Features</Text>
+          <Text dimColor>  saved of the weekly quota, last {b?.days ?? WEEK_DAYS} days</Text>
         </Text>
-        {last === null ? (
-          <Text dimColor>No turn yet. Send a prompt and Jev's answers show up here.</Text>
-        ) : (
-          <Box flexDirection="column">
-            {last.prompt ? <Text dimColor italic wrap="truncate-end">“{cleanPrompt(last.prompt)}”</Text> : null}
-            {ARM_TEXT[last.arm] ? <Text dimColor>{ARM_TEXT[last.arm]}</Text> : null}
-            {last.done ? (
-              <Text color={last.done.verdict === 'push' ? (last.done.pushed ? 'cyan' : 'yellow') : undefined} dimColor={last.done.verdict !== 'push'}>
-                done check · {doneText(last.done, doneMode === 'shadow')}
+        {keys.map(key => {
+          const on = isOn(key)
+          const f = b?.features[key]
+          const saved = f?.savedPct
+          return (
+            <Text key={`feature-${key}`} wrap="truncate-end">
+              <Text dimColor>{SWITCHES[key].hotkey} </Text>
+              <Text>{SWITCHES[key].label.padEnd(12)}</Text>
+              <Text color={on ? 'green' : undefined} dimColor={!on}>{(on ? 'on' : 'off').padEnd(5)}</Text>
+              <Text bold color={saved === undefined ? undefined : saved >= 0 ? 'green' : 'yellow'} dimColor={saved === undefined}>
+                {(saved === undefined ? '—' : quotaPct(saved)).padStart(7)}
               </Text>
-            ) : null}
-            {lj ? (
-              <Box flexDirection="column" marginTop={1}>
-                {lj.cards.length > 0 ? (
-                  <Text wrap="wrap">
-                    {lj.cards.map(c => {
-                      const cell = CARD_CELL[c] ?? CARD_CELL.pass!
-                      return <Text color={cell.color} dimColor={cell.dim}>{cell.cell}</Text>
-                    })}
-                  </Text>
-                ) : null}
-                <Text>
-                  {label(last.arm === 'shadow' ? 'Jev would hint' : 'Jev hinted')}
-                  <Text color="cyan" bold>{lj.hinted}</Text>
-                  <Text dimColor> of {lj.asked} asks{pct(lj.hinted, lj.asked)}</Text>
-                </Text>
-                {lj.hinted > 0 ? (
-                  <Text>
-                    {label(last.arm === 'shadow' ? 'Claude did too' : 'Claude followed')}
-                    <Text bold>{lj.followed}</Text>
-                    <Text dimColor> of {lj.hinted}</Text>
-                  </Text>
-                ) : null}
-                {lj.picks.length > 0 ? (
-                  <Text wrap="wrap">
-                    {label('picked')}
-                    <Text color="cyan">{toolCounts(lj.picks)}</Text>
-                  </Text>
-                ) : null}
-                {Object.keys(lj.reasons).length > 0 ? (
-                  <Text wrap="wrap">
-                    {label('left to Claude')}
-                    <Text>
-                      {Object.entries(lj.reasons)
-                        .sort((a, b) => b[1] - a[1])
-                        .map(([r, n]) => `${reasonText(r)} ${n}`)
-                        .join(' · ')}
-                    </Text>
-                  </Text>
-                ) : null}
-                {lj.ms !== undefined ? (
-                  <Text>
-                    {label('Jev latency')}
-                    <Text color={lj.ms > 1000 ? 'yellow' : undefined}>{latency(lj.ms)}</Text>
-                    <Text dimColor> per ask, before Claude's request</Text>
-                  </Text>
-                ) : null}
-              </Box>
-            ) : null}
-          </Box>
-        )}
+              <Text dimColor>  {f?.detail ?? ''}</Text>
+            </Text>
+          )
+        })}
       </Box>
 
-      {/* what it cost, and what hints saved */}
+      {/* what Jev itself took */}
       <Box marginTop={1} flexDirection="column">
-        <Text>
-          <Text bold>Spend</Text>
-          <Text dimColor>  this session</Text>
+        <Text wrap="truncate-end">
+          <Text bold>Jev usage</Text>
+          <Text dimColor>
+            {'  '}
+            {b ? `${b.usage.asks} asks` : 'no asks yet'}
+            {b?.usage.p50Ms !== undefined ? ` · p50 ${latency(b.usage.p50Ms)}` : ''}
+            {b ? ` · ${jevCost(b.usage.usd, b.usage.unpriced)}` : ''}
+            {b && b.usage.failed > 0 ? ` · ${b.usage.failed} failed` : ''}
+          </Text>
         </Text>
         <Text wrap="truncate-end">
-          {label('this session')}
-          {usage.usd !== undefined ? <Text>Claude {dollars(usage.usd)}</Text> : <Text dimColor>Claude cost unknown</Text>}
-          <Text dimColor> at API prices</Text>
-          <Text> · Jev {jevCost(session.jevUsd, session.jevUnpriced)}</Text>
-          <Text dimColor> over {session.asked} asks</Text>
-        </Text>
-        {usage.week !== undefined ? (
-          <Text wrap="truncate-end">
-            {label('weekly quota')}
-            <Text color={usage.week >= 80 ? 'red' : usage.week >= 50 ? 'yellow' : undefined} bold>{usage.week.toFixed(1)}%</Text>
-            <Text dimColor> used{usage.weekResetsAt ? ` · resets ${resets(usage.weekResetsAt)}` : ''}</Text>
-          </Text>
-        ) : (
-          <Text dimColor>{'weekly quota'.padEnd(16)}not reported (API key, or no request yet)</Text>
-        )}
-      </Box>
-
-      {/* the last days, from the log */}
-      {week ? (
-        <Box marginTop={1} flexDirection="column">
-          {week.map((line, i) =>
-            line === '' ? (
-              <Text key={`week-${i}`}> </Text>
-            ) : i === 0 ? (
-              <Text key="week-0" wrap="wrap">
-                <Text bold>{line.split(':')[0]}</Text>
-                <Text dimColor>{line.slice(line.indexOf(':') + 1)}</Text>
-              </Text>
-            ) : (
-              <Text key={`week-${i}`} wrap="wrap" dimColor={line.startsWith('  ')} color={/^\s*Hints (saved|cost)/.test(line) ? (line.includes('saved') ? 'green' : 'yellow') : undefined}>
-                {line.trim()}
-              </Text>
-            ),
+          <Text bold>Weekly quota</Text>
+          {usage.week !== undefined ? (
+            <Text>
+              {'  '}
+              <Text color={usage.week >= 80 ? 'red' : usage.week >= 50 ? 'yellow' : undefined}>{usage.week.toFixed(1)}% used</Text>
+              <Text dimColor>{usage.weekResetsAt ? ` · resets ${resets(usage.weekResetsAt)}` : ''}{usage.usd !== undefined ? ` · this session ${dollars(usage.usd)} at API prices` : ''}</Text>
+            </Text>
+          ) : (
+            <Text dimColor>  not reported (API key, or no request yet)</Text>
           )}
-        </Box>
-      ) : null}
-
-      {/* the session */}
-      <Box marginTop={1} flexDirection="column">
-        <Text bold>This session</Text>
-        <Box flexDirection="row" flexWrap="wrap">
-          {tile(String(session.turns), 'turns')}
-          {tile(String(session.requests), 'requests')}
-          {tile(`${session.hinted}${pct(session.hinted, session.asked)}`, 'hinted', 'cyan')}
-          {session.hinted > 0 ? tile(`${session.followed}${pct(session.followed, session.hinted)}`, 'followed') : null}
-          {session.controlTurns > 0 ? tile(String(session.controlTurns), 'control turns') : null}
-          {session.output ? tile(tokens(session.output), 'output') : null}
-          {sessionJev !== undefined ? tile(latency(sessionJev), 'Jev p50', sessionJev > 1000 ? 'yellow' : undefined) : null}
-        </Box>
-      </Box>
-
-      <Box marginTop={1}>
-        <Text dimColor wrap="wrap">
-          {s.mode === 'shadow'
-            ? 'Shadow: Jev is asked and its picks are recorded, but Claude never sees them. The last 7 days show how often Claude chose the same tool on its own.'
-            : last === null
-              ? "Jev picks the tool that fits Claude's next step, and Claude gets it as a hint it may ignore. Some turns run without Jev (control), so the last 7 days can tell whether hints help on your own work."
-              : 'Hints vs control puts turns with hints next to turns without Jev: same kind of work, with and without.'}
         </Text>
+        {b && b.pctPerUnit === undefined ? <Text dimColor>Savings show once a few turns have recorded the quota they used.</Text> : null}
+        {s.gateway ? <Text color="yellow" wrap="wrap">This session goes through a local proxy ({s.gateway}); if it is jev-gateway, it hints too.</Text> : null}
       </Box>
 
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
         {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
-        {ready ? <Button key="pause" hotkey="p" plain label={s.paused ? 'resume' : 'pause'} onPress={() => setPaused($, !s.paused)} /> : null}
-        {ready
-          ? (Object.keys(SWITCHES) as SwitchKey[]).map(key => (
-              <Button key={key === 'doneCheck' ? 'done' : key} hotkey={SWITCHES[key].hotkey} plain label={`${SWITCHES[key].label}: ${nextValue(key)}`} onPress={() => cycleSwitch($, key)} />
-            ))
-          : null}
+        {ready ? keys.map(key => <Button key={key === 'doneCheck' ? 'done' : key} hotkey={SWITCHES[key].hotkey} plain label={`${SWITCHES[key].label} ${isOn(key) ? 'off' : 'on'}`} onPress={() => toggle($, key)} />) : null}
         {/* the terminal's pane has its own ✕ */}
         {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
       </Box>
     </Box>
   )
-}
-
-/** The pane's switches: each one a /config option, cycled in this order. */
-const SWITCHES = {
-  doneCheck: {
-    label: 'done check',
-    hotkey: 'd',
-    order: ['shadow', 'on', 'off'],
-    text: { shadow: 'shadow · broken promises are only recorded', on: 'on · Claude is sent back to work', off: 'off · stops are not checked' },
-  },
-  effort: {
-    label: 'effort',
-    hotkey: 'e',
-    order: ['on', 'shadow', 'off'],
-    text: { on: 'on · quick status questions run at low effort', shadow: 'shadow · recorded only', off: 'off · your effort always' },
-  },
-  skillGate: {
-    label: 'skill gate',
-    hotkey: 'k',
-    order: ['on', 'shadow', 'off'],
-    text: { on: "on · skills this project won't need keep only their name", shadow: 'shadow · recorded only', off: 'off · the full skill list' },
-  },
-  freshStart: {
-    label: 'fresh start',
-    hotkey: 't',
-    order: ['ask', 'off'],
-    text: { ask: 'ask · offer /clear when a new task starts in a long conversation', off: 'off · never asks' },
-  },
-} as const
-type SwitchKey = keyof typeof SWITCHES
-
-function switchValue(key: SwitchKey): string {
-  return { doneCheck: doneMode, effort: effortMode, skillGate: skillMode, freshStart: topicMode }[key]
-}
-
-function setSwitch(key: SwitchKey, value: string): void {
-  if (key === 'doneCheck') doneMode = value as typeof doneMode
-  else if (key === 'effort') effortMode = value as typeof effortMode
-  else if (key === 'skillGate') skillMode = value as typeof skillMode
-  else topicMode = value as typeof topicMode
-}
-
-function nextValue(key: SwitchKey): string {
-  const order: readonly string[] = SWITCHES[key].order
-  return order[(order.indexOf(switchValue(key)) + 1) % order.length]!
-}
-
-/** Moves a switch to its next value, saved in /config like the menu would. */
-async function cycleSwitch($: $, key: SwitchKey): Promise<void> {
-  const value = nextValue(key)
-  const label = SWITCHES[key].label
-  try {
-    const row = (await $.config.list()).find(r => r.key.endsWith(`.${key}`) && r.key.startsWith('jev'))
-    const written = row ? await $.config.set({ key: row.key, value }) : { deny: 'the option is not in /config' }
-    if (written.deny !== undefined) {
-      $.ui.toast(`Jev: the ${label} stays ${switchValue(key)} (${written.deny}).`)
-      return
-    }
-  } catch (error) {
-    $.ui.toast(`Jev: the ${label} stays ${switchValue(key)} (${message(error)}).`)
-    return
-  }
-  setSwitch(key, value)
-  await update($, status, s => ({ ...s, [key]: value }))
 }
 
 /** `Mon 14:00` for a reset time. */
@@ -1193,10 +1024,11 @@ async function setup($: $, cwd: string): Promise<string> {
 // ------------------------------------------------------------ hooks
 
 export const register: Register = (on, options) => {
-  mode = options.mode === 'off' || options.mode === 'shadow' ? options.mode : 'on'
-  doneMode = options.doneCheck === 'on' || options.doneCheck === 'off' ? options.doneCheck : 'shadow'
-  effortMode = options.effort === 'shadow' || options.effort === 'off' ? options.effort : 'on'
-  skillMode = options.skillGate === 'shadow' || options.skillGate === 'off' ? options.skillGate : 'on'
+  // Every feature is a plain on/off; values from older versions (shadow) count as their nearest.
+  mode = options.mode === 'off' ? 'off' : 'on'
+  doneMode = options.doneCheck === 'on' ? 'on' : 'off'
+  effortMode = options.effort === 'off' ? 'off' : 'on'
+  skillMode = options.skillGate === 'off' ? 'off' : 'on'
   topicMode = options.freshStart === 'off' ? 'off' : 'ask'
   controlPercent = typeof options.controlPercent === 'number' && options.controlPercent >= 0 && options.controlPercent <= 100 ? options.controlPercent : 20
   excludedRepos = typeof options.excludedRepos === 'string' ? options.excludedRepos : ''
@@ -1230,9 +1062,10 @@ export const register: Register = (on, options) => {
     const [t, d] = await Promise.all([triaged, hinted])
     if (!t && fresh) o.triage = { quick: false, newTopic: false, fresh }
     if (t) {
-      o.triage = { ...t, ...(t.quick && effortMode !== 'off' ? { lowEffort: effortMode === 'on' ? 'applied' : 'shadow' } : {}), ...(fresh ? { fresh } : {}) }
+      const lowEffort = !t.quick || effortMode === 'off' ? undefined : arm === 'control' ? 'control' : effortMode === 'on' ? 'applied' : 'shadow'
+      o.triage = { ...t, ...(lowEffort ? { lowEffort } : {}), ...(fresh ? { fresh } : {}) }
       // A new, self-contained task in a long conversation: offer to start fresh instead of re-reading it all.
-      if (t.newTopic && !fresh && topicMode === 'ask' && !e.attachments?.length) {
+      if (t.newTopic && !fresh && topicMode !== 'off' && !e.attachments?.length) {
         const size = await contextTokens($)
         if (size >= TOPIC_MIN_TOKENS) {
           const choice = await ask(
@@ -1244,6 +1077,7 @@ export const register: Register = (on, options) => {
           const how = choice === FRESH_OPTIONS.clear ? 'clear' : choice === FRESH_OPTIONS.compact ? 'compact' : undefined
           if (how) {
             opening = undefined
+            freshFrom = size
             freshStart($, how, e.text)
             return { drop: `Jev: ${how === 'clear' ? 'clearing the conversation' : 'compacting the conversation'}, then sending your prompt again.` }
           }
@@ -1337,7 +1171,7 @@ export const register: Register = (on, options) => {
     await ensureSession($)
     const turn = current ? turns.get(current) : undefined
     // The main loop only, Jev's turns only, and never a stop that a push already caused.
-    if (doneMode === 'off' || e.agent_id || e.stop_hook_active || !turn || (turn.arm !== 'hint' && turn.arm !== 'shadow' && turn.arm !== 'control') || result.block) return result
+    if (doneMode === 'off' || e.agent_id || e.stop_hook_active || !turn || turn.arm === 'excluded' || result.block) return result
     const done = checkStop($, e)
     turn.done = done
     const d = await done

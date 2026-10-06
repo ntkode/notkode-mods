@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"
@@ -19,10 +19,9 @@
     "mode": {
       "type": "string",
       "title": "Jev: hints",
-      "description": "on: Jev is asked before Claude's requests and Claude gets its confident picks as a hint. shadow: Jev is asked and its picks are recorded, but nothing reaches Claude. off: Jev is never asked.",
+      "description": "on: before Claude's requests, Jev's confident tool picks reach Claude as a hint. off: no hints.",
       "options": [
         "on",
-        "shadow",
         "off"
       ],
       "default": "on"
@@ -30,27 +29,25 @@
     "controlPercent": {
       "type": "number",
       "title": "Jev: control group (%)",
-      "description": "With hints on, this share of turns runs without Jev, so the /jev pane can compare hints with no hints on your own work. 0 turns it off.",
+      "description": "This share of turns runs with no Jev feature at all, the baseline the /jev board measures every saving against. 0 turns it off (and the board cannot measure hints or effort).",
       "default": 20
     },
     "doneCheck": {
       "type": "string",
       "title": "Jev: done check",
-      "description": "When Claude stops after promising more work, with nothing running and nothing asked of you, Jev catches it. shadow: recorded in /jev only. on: Claude is sent back to work (once per turn). off: never checked.",
+      "description": "on: when Claude stops after promising more work, with nothing running and nothing asked of you, it is sent back to work (once per turn). off: never checked.",
       "options": [
-        "shadow",
         "on",
         "off"
       ],
-      "default": "shadow"
+      "default": "off"
     },
     "effort": {
       "type": "string",
       "title": "Jev: effort",
-      "description": "on: quick status questions (is it deployed, are we done) run at low effort, on the same model, back to your effort if the turn grows. shadow: recorded only. off: your effort always.",
+      "description": "on: quick status questions (is it deployed, are we done) run at low effort, on the same model, back to your effort if the turn grows. off: your effort always.",
       "options": [
         "on",
-        "shadow",
         "off"
       ],
       "default": "on"
@@ -58,10 +55,9 @@
     "skillGate": {
       "type": "string",
       "title": "Jev: skill gate",
-      "description": "on: at session start Jev judges which skills this project needs; the others keep only their name in the list Claude reads on every request (still callable). shadow: recorded only. off: the full list.",
+      "description": "on: at session start Jev judges which skills this project needs; the others keep only their name in the list Claude reads on every request (still callable). off: the full list.",
       "options": [
         "on",
-        "shadow",
         "off"
       ],
       "default": "on"
@@ -69,12 +65,12 @@
     "freshStart": {
       "type": "string",
       "title": "Jev: fresh start",
-      "description": "ask: when a prompt starts a new task that needs nothing from a long conversation, Jev offers /clear or /compact before sending it. off: never asks.",
+      "description": "on: when a prompt starts a new task that needs nothing from a long conversation, Jev offers /clear or /compact before sending it. off: never asks.",
       "options": [
-        "ask",
+        "on",
         "off"
       ],
-      "default": "ask"
+      "default": "on"
     },
     "excludedRepos": {
       "type": "string",

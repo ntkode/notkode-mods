@@ -179,7 +179,7 @@ function world(on: On, clock: MockClock, setup: Setup = {}): World {
     }
     return { text: `no such command: ${e.command}` }
   })
-  const config: Record<string, unknown> = { 'jev.doneCheck': 'shadow' }
+  const config: Record<string, unknown> = { 'jev.doneCheck': 'off', 'jev.effort': 'on', 'jev.skillGate': 'on', 'jev.freshStart': 'on', 'jev.mode': 'on' }
   on('config.list', () => ({ value: Object.entries(config).map(([key, value]) => ({ key, value })) as never }))
   on('config.set', (_$, e) => {
     config[e.key] = e.value
@@ -295,8 +295,7 @@ test('asks Jev before the first request and after the tools; each hint rides the
   expect(await lines($)).toEqual(['Jev idle', 'routing on'])
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /1 turns · 1 with hints · 0 control · 0 shadow\./ })).toBeDefined()
-  expect(await pane.find({ type: 'Button', key: 'report' })).toBeUndefined()
+  expect(await pane.find({ text: /1 hints in 1 turns|measuring: 1\/5 with, 0\/5 control/ })).toBeDefined()
   await pane.unmount()
 })
 
@@ -399,24 +398,6 @@ test('a control turn: Jev sits it out, the owl sleeps, and the band says why', {
   expect(logged(w)[0].jev).toBeUndefined()
 })
 
-test('shadow: Jev is asked and recorded, Claude gets nothing, and Claude choosing the same tool counts', { options: { mode: 'shadow' } }, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  const sent = await submit($, 'run the tests')
-  expect('context' in sent ? sent.context : undefined).toBeUndefined()
-  expect(await lines($)).toEqual(['Jev would hint Read 0.90 (shadow)', 'routing in shadow · Claude sees no hints'])
-  await $.turn.start({ text: 'run the tests', turnId: 'turn-1' })
-  w.responses.push([{ name: 'Read', input: { file_path: 'package.json' } }])
-  await step($, 'turn-1', 0)
-  w.messages = () => [{ role: 'user', text: 'run the tests', toolUses: [] }]
-  const read = await $.tool.call({ tool: 'Read', file_path: 'package.json' })
-  expect('context' in read ? read.context : undefined).toBeUndefined()
-  await step($, 'turn-1', 1)
-  await complete($, w, 'turn-1')
-  expect(logged(w)[0]).toMatchObject({ arm: 'shadow', jev: { asked: 2, hinted: 2, followed: 1 } })
-})
-
 test('an excluded repo: Jev is never asked, the band stays out of the way, and its words stay out of the log', { options: { excludedRepos: 'demo-app' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
@@ -512,24 +493,6 @@ test('a local proxy the session started with is kept, and the pane notes it', HI
   await pane.unmount()
 })
 
-test("the pane shows the last turn's answers, and pausing stops Jev for this session", HINTS, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  await plainTurn($, w, 'why does the test fail?')
-  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /ready/ })).toBeDefined()
-  expect(await pane.find({ text: /Jev hinted/ })).toBeDefined()
-  expect(await pane.find({ text: /^Read$/ })).toBeDefined()
-  await pane.press({ key: 'pause' })
-  await pane.unmount()
-
-  expect(await lines($)).toEqual(['Jev paused', 'routing paused for this session'])
-  await plainTurn($, w, 'and now?', 'turn-2')
-  expect(w.asks).toHaveLength(1)
-  expect(logged(w)[1]).toMatchObject({ arm: 'off' })
-})
-
 test("spend: Jev's price per call, Claude's cost and weekly quota per turn, in the log and the pane", HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
@@ -544,11 +507,9 @@ test("spend: Jev's price per call, Claude's cost and weekly quota per turn, in t
   expect(logged(w)[0]).toMatchObject({ actual: { usd: 0.35, weekPct: 0.5, weekUsed: 40.5 }, jev: { usd: 0.00012, unpriced: 0 } })
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /Claude \$1\.35/ })).toBeDefined()
-  expect(await pane.find({ text: /Jev \$0\.0001/ })).toBeDefined()
+  expect(await pane.find({ text: /this session \$1\.35 at API prices/ })).toBeDefined()
+  expect(await pane.find({ text: /1 asks · p50 .* · \$0\.0001/ })).toBeDefined()
   expect(await pane.find({ text: /40\.5%/ })).toBeDefined()
-  expect(await pane.find({ text: /need 5 priced turns with hints and 5 control turns \(have 1 and 0\)/ })).toBeDefined()
-  expect(await pane.find({ text: /Spent over 1 tracked turns: Claude \$0\.350 at API prices · Jev \$0\.0001 over 1 asks\./ })).toBeDefined()
   await pane.unmount()
 })
 
@@ -574,23 +535,6 @@ async function stoppingTurn($: Engine, w: World, last: string, stop: { tasks?: {
   return stopped
 }
 
-test('done check in shadow: a promise with nothing running is recorded, and Claude is not stopped', HINTS, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
-  const stopped = await stoppingTurn($, w, "The run is underway. I'll report when it lands.")
-  expect(stopped.block).toBeUndefined()
-  expect(Object.keys(w.asks[1]!.questions)).toEqual(['requested', 'waiting', 'promised'])
-  // the stop's own message is part of what Jev reads
-  expect(w.asks[1]!.state.conversation.at(-1)).toEqual({ role: 'assistant', text: "The run is underway. I'll report when it lands." })
-  expect(logged(w)[0].done).toMatchObject({ verdict: 'push', pushed: false, promised: 0.96 })
-  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /done check · Claude stopped on a promise; Jev would send it back to work \(shadow\)/ })).toBeDefined()
-  expect(await pane.find({ text: /Done check: 1 stops checked · 1 broken promises \(100%\), 1 only recorded \(shadow\)/ })).toBeDefined()
-  await pane.unmount()
-})
-
 test('done check on: the broken promise sends Claude back to work, once per turn', { options: { controlPercent: 0, doneCheck: 'on' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
@@ -611,7 +555,7 @@ test('done check on: the broken promise sends Claude back to work, once per turn
   expect(logged(w)[0].done).toMatchObject({ verdict: 'push', pushed: true })
 })
 
-test('done check: work left running keeps the promise, and Jev is not asked', HINTS, async ($, on) => {
+test('done check: work left running keeps the promise, and Jev is not asked', { options: { controlPercent: 0, doneCheck: 'on' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   await start($)
@@ -650,22 +594,6 @@ test('done check off: stops are never checked', { options: { controlPercent: 0, 
   expect(logged(w)[0].done).toBeUndefined()
 })
 
-test('the pane switches the done check: shadow → on → off, saved in /config, and on takes effect at once', HINTS, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /done check +shadow · broken promises are only recorded/ })).toBeDefined()
-  await pane.press({ key: 'done' })
-  expect(w.configSets).toEqual(['jev.doneCheck=on'])
-  expect(await pane.find({ text: /on · Claude is sent back to work/ })).toBeDefined()
-  expect(await pane.find({ type: 'Button', key: 'done', text: 'done check: off' })).toBeDefined()
-  await pane.unmount()
-
-  w.jev.push(answer('Bash'), doneAnswer(0.97, 0.05, 0.96))
-  expect((await stoppingTurn($, w, "I'll keep extracting.")).block).toBe(DONE_NUDGE)
-})
-
 test('a reload (no session.start) sets the session up on first use: the key is read and Jev is asked', HINTS, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
@@ -692,16 +620,6 @@ test('effort: a quick status question runs at low effort on the same model, and 
   await plainTurn($, w, 'implement the export', 'turn-2')
   expect(w.efforts.at(-1)).toBe('xhigh')
   expect(logged(w)[1].triage.lowEffort).toBeUndefined()
-})
-
-test('effort in shadow: recorded, never applied', { options: { controlPercent: 0, effort: 'shadow' } }, async ($, on) => {
-  const clock = mock.clock(on, { now: 1_000 })
-  const w = world(on, clock)
-  await start($)
-  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.85, quick: 0.9 }))
-  await plainTurn($, w, 'are we done?')
-  expect(w.efforts).toEqual(['xhigh'])
-  expect(logged(w)[0].triage.lowEffort).toBe('shadow')
 })
 
 test('fresh start: a new task in a long conversation is offered /clear, then sent again as yours', HINTS, async ($, on) => {
@@ -755,17 +673,75 @@ test('skill gate: skills the project will not need keep only their name, the sam
   const again = await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
   expect(again.text).toBe(first.text)
   expect(w.skillAsks).toHaveLength(1)
+  await plainTurn($, w, 'deploy it')
+  expect(logged(w)[0].saved.skills).toBeGreaterThan(0)
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /skill list \d+ → \d+ tokens per request · 2 of 4 kept whole/ })).toBeDefined()
+  expect(await pane.find({ text: /fewer tokens on every request/ })).toBeDefined()
   await pane.unmount()
 })
 
-test('skill gate in shadow, or without an answer from Jev: the listing is left whole', { options: { controlPercent: 0, skillGate: 'shadow' } }, async ($, on) => {
+test('hints off: no hint reaches Claude, Jev is not asked about tools, and the other features still run', { options: { controlPercent: 0, mode: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.9, quick: 0.9 }))
+  const sent = await plainTurn($, w, 'are we done?')
+  expect('context' in sent ? sent.context : undefined).toBeUndefined()
+  expect(w.asks).toHaveLength(0)
+  expect(w.efforts).toEqual(['low'])
+  expect(logged(w)[0]).toMatchObject({ arm: 'off', triage: { lowEffort: 'applied' } })
+})
+
+test('effort off: never applied', { options: { controlPercent: 0, effort: 'off' } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.85, quick: 0.9 }))
+  await plainTurn($, w, 'are we done?')
+  expect(w.efforts).toEqual(['xhigh'])
+  expect(logged(w)[0].triage.lowEffort).toBeUndefined()
+})
+
+test('a control turn runs with no Jev feature: no hint, no low effort, recorded to compare with', { options: { controlPercent: 100 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.triage.push(triageAnswer({ effort: 'status', confidence: 0.9, quick: 0.9 }))
+  await plainTurn($, w, 'is it deployed?')
+  expect(w.efforts).toEqual(['xhigh'])
+  expect(logged(w)[0]).toMatchObject({ arm: 'control', triage: { lowEffort: 'control' } })
+})
+
+test('skill gate off: the listing stays whole and Jev is not asked', { options: { controlPercent: 0, skillGate: 'off' } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
   w.skillAnswer = () => 0.05
   await start($)
   const out = await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
   expect(out.text).toBe(LISTING)
-  expect(w.skillAsks).toHaveLength(1)
+  expect(w.skillAsks).toHaveLength(0)
+})
+
+test('the board: each feature on or off with a key, saved in /config, and what it saved of the weekly quota', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.skillAnswer = i => (i === 0 ? 0.9 : 0.05)
+  w.usage = { usd: 0, week: 10 }
+  await start($)
+  await $.prompt.attachment({ type: 'skill_listing', text: LISTING, origin: { kind: 'engine' } } as never)
+  for (let i = 0; i < 3; i++) {
+    w.usage = { usd: w.usage.usd, week: w.usage.week! + 0.5 }
+    await plainTurn($, w, `turn ${i}`, `turn-${i}`)
+  }
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  expect(await pane.find({ text: /^skill gate/ })).toBeDefined()
+  expect(await pane.find({ text: /\+\d+\.\d%|<0\.1%/ })).toBeDefined()
+  expect(await pane.find({ text: /measuring: 3\/5 with, 0\/5 control/ })).toBeDefined()
+  expect(await pane.find({ text: /Weekly quota/ })).toBeDefined()
+  await pane.press({ key: 'done' })
+  await pane.press({ key: 'effort' })
+  expect(w.configSets).toEqual(['jev.doneCheck=on', 'jev.effort=off'])
+  expect(await pane.find({ type: 'Button', key: 'done', text: 'done check off' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', key: 'effort', text: 'effort on' })).toBeDefined()
+  await pane.unmount()
 })

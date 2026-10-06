@@ -1,4 +1,4 @@
-import type { JevEconomy } from '../types'
+import type { JevBoard, JevEconomy } from '../types'
 
 // Pure parts of the mod: what Jev is asked, how its answer becomes a hint, the key file, the log
 // and the report. Nothing here touches `$`, so tests run it as is.
@@ -587,7 +587,9 @@ export type TurnRecord = {
   /** The done check at the turn's last stop. */
   done?: DoneCheck
   /** What Jev made of the prompt, and what the mod did with it. */
-  triage?: Triage & { lowEffort?: 'applied' | 'shadow' | 'exited'; fresh?: 'clear' | 'compact' | 'kept' | 'dismissed' }
+  triage?: Triage & { lowEffort?: 'applied' | 'shadow' | 'exited' | 'control'; fresh?: 'clear' | 'compact' | 'kept' | 'dismissed' }
+  /** Tokens per request each feature took off the context Claude re-reads (skill gate, an earlier fresh start). */
+  saved?: { skills?: number; fresh?: number }
 }
 
 export type LogRecord = TurnRecord
@@ -778,6 +780,91 @@ export function economyLines(e: Economy): string[] {
     `  Net of Jev: ${dollars(s.netUsd)}. An estimate: median turn with hints vs median control turn.`,
   )
   return lines
+}
+
+// ---------------------------------------------------------------- the board
+
+/**
+ * Relative weights of token types (their API price ratios), so turns of different shapes compare.
+ * The account's own quota rate turns them into weekly-quota percent.
+ */
+export const UNIT_WEIGHTS = { input: 1, cacheRead: 0.1, cacheWrite: 1.25, output: 5 } as const
+
+export function turnUnits(u: NonNullable<TurnRecord['actual']['usage']>): number {
+  return u.input * UNIT_WEIGHTS.input + u.cacheRead * UNIT_WEIGHTS.cacheRead + u.cacheWrite * UNIT_WEIGHTS.cacheWrite + u.output * UNIT_WEIGHTS.output
+}
+
+export type FeatureKey = 'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck'
+
+/** What one feature did over the window: its share of the weekly quota saved (negative: it cost), and a few words. */
+export type FeatureStat = { savedPct?: number; detail: string }
+
+export function board(records: readonly LogRecord[], days: number): JevBoard {
+  const turns = records.filter(r => r.type === 'turn' && r.v === 4)
+  const metered = turns.filter(t => t.actual.usage)
+  const units = (t: TurnRecord) => turnUnits(t.actual.usage!)
+  const rated = metered.filter(t => t.actual.weekPct !== undefined)
+  const ratedUnits = rated.reduce((s, t) => s + units(t), 0)
+  const rate = ratedUnits > 0 ? rated.reduce((s, t) => s + t.actual.weekPct!, 0) / ratedUnits : undefined
+  const pctOf = (u: number) => (rate !== undefined ? u * rate : undefined)
+  // Tokens a feature took off every request were cache reads the turn did not make.
+  const readSaved = (key: 'skills' | 'fresh') => metered.reduce((s, t) => s + (t.saved?.[key] ?? 0) * t.actual.steps * UNIT_WEIGHTS.cacheRead, 0)
+  /** Median turn with the feature vs median turn without it, times the turns with it. */
+  const compare = (on: readonly TurnRecord[], off: readonly TurnRecord[]): number | undefined =>
+    on.length >= MIN_GROUP && off.length >= MIN_GROUP ? (median(off.map(units)) - median(on.map(units))) * on.length : undefined
+  const measuring = (on: number, off: number) => `measuring: ${Math.min(on, MIN_GROUP)}/${MIN_GROUP} with, ${Math.min(off, MIN_GROUP)}/${MIN_GROUP} control`
+
+  const hint = metered.filter(t => t.arm === 'hint')
+  const control = metered.filter(t => t.arm === 'control')
+  const hintUnits = compare(hint, control)
+  const asked = turns.reduce((s, t) => s + (t.jev?.asked ?? 0), 0)
+  const hinted = turns.reduce((s, t) => s + (t.jev?.hinted ?? 0), 0)
+
+  const quickOn = metered.filter(t => t.triage?.lowEffort === 'applied' || t.triage?.lowEffort === 'exited')
+  const quickOff = metered.filter(t => t.triage?.lowEffort === 'control')
+  const effortUnits = compare(quickOn, quickOff)
+
+  const gated = metered.filter(t => (t.saved?.skills ?? 0) > 0)
+  const lastGate = gated.at(-1)?.saved?.skills
+  const freshTurns = turns.filter(t => t.triage?.fresh === 'clear' || t.triage?.fresh === 'compact')
+
+  const done = turns.filter(t => t.done)
+  const pushed = done.filter(t => t.done!.verdict === 'push').length
+
+  const ms = turns.flatMap(t => t.jev?.ms ?? [])
+  const failed = turns.reduce((s, t) => s + Object.entries(t.jev?.reasons ?? {}).filter(([k]) => k === 'jev_error' || k === 'jev_timeout').reduce((a, [, n]) => a + n, 0), 0)
+
+  return {
+    days,
+    turns: turns.length,
+    ...(rate !== undefined ? { pctPerUnit: rate } : {}),
+    features: {
+      hints: {
+        ...(hintUnits !== undefined && rate !== undefined ? { savedPct: hintUnits * rate } : {}),
+        detail: hintUnits === undefined ? `${hinted} hints · ${measuring(hint.length, control.length)}` : `${hinted} hints in ${hint.length} turns, vs ${control.length} control turns`,
+      },
+      effort: {
+        ...(effortUnits !== undefined && rate !== undefined ? { savedPct: effortUnits * rate } : {}),
+        detail: effortUnits === undefined ? `${quickOn.length} quick questions at low effort · ${measuring(quickOn.length, quickOff.length)}` : `${quickOn.length} quick questions at low effort`,
+      },
+      skillGate: {
+        ...(gated.length > 0 ? { savedPct: pctOf(readSaved('skills')) } : {}),
+        detail: gated.length > 0 ? `${tokens(lastGate ?? 0)} fewer tokens on every request` : 'no gated session yet',
+      },
+      freshStart: {
+        ...(freshTurns.length > 0 ? { savedPct: pctOf(readSaved('fresh')) } : {}),
+        detail: `${freshTurns.length} fresh starts`,
+      },
+      doneCheck: { detail: `${done.length} stops checked · ${pushed} broken promises` },
+    },
+    usage: {
+      asks: asked,
+      ...(ms.length > 0 ? { p50Ms: median(ms) } : {}),
+      usd: turns.reduce((s, t) => s + (t.jev?.usd ?? 0), 0),
+      unpriced: turns.reduce((s, t) => s + (t.jev?.unpriced ?? 0), 0),
+      failed,
+    },
+  }
 }
 
 // ---------------------------------------------------------------- helpers

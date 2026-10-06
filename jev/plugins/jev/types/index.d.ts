@@ -27,6 +27,16 @@ export type JevEconomy = {
   }
 }
 
+/** The /jev board over the last days: each feature's saving, and what Jev itself took. */
+export type JevBoard = {
+  days: number
+  turns: number
+  /** Weekly-quota percent per weighted token unit, learned from the account's own turns. */
+  pctPerUnit?: number
+  features: Record<'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck', { savedPct?: number; detail: string }>
+  usage: { asks: number; p50Ms?: number; usd: number; unpriced: number; failed: number }
+}
+
 /** The last finished turn as the pane draws it. */
 export type JevTurnView = {
   prompt: string
@@ -89,13 +99,13 @@ declare module 'claude-code' {
         /** Jev is not asked in this session until it is resumed (the pane's switch). */
         paused?: boolean
         /** The done check's mode, as /config or the pane's switch set it. */
-        doneCheck?: 'shadow' | 'on' | 'off'
+        doneCheck?: 'on' | 'off'
         /** Low effort for quick status questions. */
-        effort?: 'on' | 'shadow' | 'off'
+        effort?: 'on' | 'off'
         /** Skills the project won't need keep only their name in the listing. */
-        skillGate?: 'on' | 'shadow' | 'off'
+        skillGate?: 'on' | 'off'
         /** Offer /clear or /compact when a new task starts in a long conversation. */
-        freshStart?: 'ask' | 'off'
+        freshStart?: 'on' | 'off'
       }
       last: JevTurnView | null
       session: JevSessionView
@@ -105,8 +115,8 @@ declare module 'claude-code' {
       decision: { mode: 'hint' | 'pass'; tool?: string; confidence?: number; reason?: string; shadow?: boolean; at: number } | null
       /** The skill gate's decision for the session: the same listing all session long, reloads included. */
       skills: { session: string; mode: 'on' | 'shadow'; trim: string[]; count: number; before: number; after: number } | null
-      /** The last 7 days from the log, as the pane's lines (answers, hints vs control, spend, savings); refreshed after each turn. */
-      week: string[] | null
+      /** The board over the last 7 days: each feature's saving, Jev's own usage; refreshed after each turn. */
+      board: JevBoard | null
       /** ANTHROPIC_BASE_URL before v0.4 routed the session through its gateway: read once, to undo that. */
       original: { saved: boolean; value: string | null }
     }
