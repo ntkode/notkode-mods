@@ -799,6 +799,12 @@ export type FeatureKey = 'hints' | 'effort' | 'skillGate' | 'freshStart' | 'done
 /** What one feature did over the window: its share of the weekly quota saved (negative: it cost), and a few words. */
 export type FeatureStat = { savedPct?: number; detail: string }
 
+/** What the features saved together, as a share of the weekly quota; undefined while none has a figure yet. */
+export function totalSaved(features: Record<string, FeatureStat>): number | undefined {
+  const figures = Object.values(features).flatMap(f => (f.savedPct === undefined ? [] : [f.savedPct]))
+  return figures.length > 0 ? figures.reduce((a, b) => a + b, 0) : undefined
+}
+
 export function board(records: readonly LogRecord[], days: number): JevBoard {
   const turns = records.filter(r => r.type === 'turn' && r.v === 4)
   const metered = turns.filter(t => t.actual.usage)

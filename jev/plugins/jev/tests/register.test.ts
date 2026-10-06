@@ -507,9 +507,7 @@ test("spend: Jev's price per call, Claude's cost and weekly quota per turn, in t
   expect(logged(w)[0]).toMatchObject({ actual: { usd: 0.35, weekPct: 0.5, weekUsed: 40.5 }, jev: { usd: 0.00012, unpriced: 0 } })
 
   const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
-  expect(await pane.find({ text: /this session \$1\.35 at API prices/ })).toBeDefined()
-  expect(await pane.find({ text: /1 asks · p50 .* · \$0\.0001/ })).toBeDefined()
-  expect(await pane.find({ text: /40\.5%/ })).toBeDefined()
+  expect(await pane.find({ text: /^Spent on Jev\s+\$0\.0001  last 7 days$/ })).toBeDefined()
   await pane.unmount()
 })
 
@@ -737,7 +735,8 @@ test('the board: each feature on or off with a key, saved in /config, and what i
   expect(await pane.find({ text: /^skill gate/ })).toBeDefined()
   expect(await pane.find({ text: /\+\d+\.\d%|<0\.1%/ })).toBeDefined()
   expect(await pane.find({ text: /measuring: 3\/5 with, 0\/5 control/ })).toBeDefined()
-  expect(await pane.find({ text: /Weekly quota/ })).toBeDefined()
+  // the total is what the features saved together
+  expect(await pane.find({ text: /^Quota saved\s+(\+\d+\.\d%|<0\.1%)  of the weekly quota$/ })).toBeDefined()
   await pane.press({ key: 'done' })
   await pane.press({ key: 'effort' })
   expect(w.configSets).toEqual(['jev.doneCheck=on', 'jev.effort=off'])

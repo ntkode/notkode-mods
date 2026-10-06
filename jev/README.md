@@ -81,9 +81,10 @@ file, so a key you already set up there is found and kept. The clipboard is clea
 the key is never shown or passed on a command line. Keys in the environment (`OPENROUTER_API_KEY`,
 `TYPESAFE_API_KEY`, …) work too and win over the file.
 
-Open the board with `/jev`: each feature with its on/off switch (keys `h` hints, `e` effort, `k`
-skill gate, `t` fresh start, `d` done check) and what it saved of the weekly quota, then Jev's own
-usage (asks, latency, cost, failures) and the weekly quota used. Every feature works on its own.
+Open the board with `/jev`. At the top, the two figures that matter over the last 7 days: what Jev
+cost, and how much of the weekly quota it saved. Then each feature with its on/off switch (keys `h`
+hints, `e` effort, `k` skill gate, `t` fresh start, `d` done check) and its own share of that saving.
+Every feature works on its own.
 
 ## Settings
 

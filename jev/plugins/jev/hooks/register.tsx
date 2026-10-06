@@ -28,6 +28,7 @@ import {
   doneVerdict,
   decisionText,
   dollars,
+  totalSaved,
   jevCost,
   duration,
   emptyJevTurn,
@@ -37,7 +38,6 @@ import {
   isGatewayOn,
   isValidKey,
   jevAccess,
-  latency,
   localGatewayOrigin,
   median,
   normalizeAnswers,
@@ -853,10 +853,10 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const s = await read($, status)
   const b = await read($, boardView)
-  const usage = await usageNow($)
   const state = STATE_TEXT[s.state] ?? { text: s.state, color: 'gray' }
   const ready = s.state === 'ready'
   const keys = Object.keys(SWITCHES) as SwitchKey[]
+  const saved = b ? totalSaved(b.features) : undefined
 
   return (
     <Box flexDirection="column">
@@ -869,6 +869,20 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       </Box>
       {s.state === 'no_key' ? <Text color="yellow">Run /jev-setup (or press s) to add a key for Jev.</Text> : null}
 
+      {/* the two figures that matter: what Jev cost, and what it saved */}
+      <Box marginTop={1} flexDirection="column">
+        <Text wrap="truncate-end">
+          <Text bold>{'Spent on Jev'.padEnd(15)}</Text>
+          <Text>{b ? jevCost(b.usage.usd, b.usage.unpriced) : dollars(0)}</Text>
+          <Text dimColor>  last {b?.days ?? WEEK_DAYS} days</Text>
+        </Text>
+        <Text wrap="truncate-end">
+          <Text bold>{'Quota saved'.padEnd(15)}</Text>
+          {saved === undefined ? <Text dimColor>measuring…</Text> : <Text bold color={saved >= 0 ? 'green' : 'yellow'}>{quotaPct(saved)}</Text>}
+          <Text dimColor>  of the weekly quota</Text>
+        </Text>
+      </Box>
+
       {/* each feature: on or off, and what it saved of the weekly quota */}
       <Box marginTop={1} flexDirection="column">
         <Text>
@@ -878,14 +892,14 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         {keys.map(key => {
           const on = isOn(key)
           const f = b?.features[key]
-          const saved = f?.savedPct
+          const featureSaved = f?.savedPct
           return (
             <Text key={`feature-${key}`} wrap="truncate-end">
               <Text dimColor>{SWITCHES[key].hotkey} </Text>
               <Text>{SWITCHES[key].label.padEnd(12)}</Text>
               <Text color={on ? 'green' : undefined} dimColor={!on}>{(on ? 'on' : 'off').padEnd(5)}</Text>
-              <Text bold color={saved === undefined ? undefined : saved >= 0 ? 'green' : 'yellow'} dimColor={saved === undefined}>
-                {(saved === undefined ? '—' : quotaPct(saved)).padStart(7)}
+              <Text bold color={featureSaved === undefined ? undefined : featureSaved >= 0 ? 'green' : 'yellow'} dimColor={featureSaved === undefined}>
+                {(featureSaved === undefined ? '—' : quotaPct(featureSaved)).padStart(7)}
               </Text>
               <Text dimColor>  {f?.detail ?? ''}</Text>
             </Text>
@@ -893,33 +907,12 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         })}
       </Box>
 
-      {/* what Jev itself took */}
-      <Box marginTop={1} flexDirection="column">
-        <Text wrap="truncate-end">
-          <Text bold>Jev usage</Text>
-          <Text dimColor>
-            {'  '}
-            {b ? `${b.usage.asks} asks` : 'no asks yet'}
-            {b?.usage.p50Ms !== undefined ? ` · p50 ${latency(b.usage.p50Ms)}` : ''}
-            {b ? ` · ${jevCost(b.usage.usd, b.usage.unpriced)}` : ''}
-            {b && b.usage.failed > 0 ? ` · ${b.usage.failed} failed` : ''}
-          </Text>
-        </Text>
-        <Text wrap="truncate-end">
-          <Text bold>Weekly quota</Text>
-          {usage.week !== undefined ? (
-            <Text>
-              {'  '}
-              <Text color={usage.week >= 80 ? 'red' : usage.week >= 50 ? 'yellow' : undefined}>{usage.week.toFixed(1)}% used</Text>
-              <Text dimColor>{usage.weekResetsAt ? ` · resets ${resets(usage.weekResetsAt)}` : ''}{usage.usd !== undefined ? ` · this session ${dollars(usage.usd)} at API prices` : ''}</Text>
-            </Text>
-          ) : (
-            <Text dimColor>  not reported (API key, or no request yet)</Text>
-          )}
-        </Text>
+      {(b && b.pctPerUnit === undefined) || s.gateway ? (
+        <Box marginTop={1} flexDirection="column">
         {b && b.pctPerUnit === undefined ? <Text dimColor>Savings show once a few turns have recorded the quota they used.</Text> : null}
         {s.gateway ? <Text color="yellow" wrap="wrap">This session goes through a local proxy ({s.gateway}); if it is jev-gateway, it hints too.</Text> : null}
-      </Box>
+        </Box>
+      ) : null}
 
       <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
         {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
@@ -929,14 +922,6 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
       </Box>
     </Box>
   )
-}
-
-/** `Mon 14:00` for a reset time. */
-function resets(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return iso
-  const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]
-  return `${day} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
 /** Stops or resumes asking Jev in this session alone. */
