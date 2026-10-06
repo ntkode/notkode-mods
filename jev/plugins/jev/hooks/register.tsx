@@ -28,6 +28,7 @@ import {
   doneVerdict,
   decisionText,
   dollars,
+  columnChart,
   totalSaved,
   jevCost,
   duration,
@@ -743,7 +744,7 @@ async function finish($: $, turnId: string, turn: Turn, e: TurnEnd): Promise<voi
 
 /** The last days from the log, for the pane: what Jev answered, hints vs control, spend, savings. */
 async function refreshWeek($: $): Promise<void> {
-  const b = boardOf(await readLogs($, WEEK_DAYS), WEEK_DAYS)
+  const b = boardOf(await readLogs($, WEEK_DAYS), WEEK_DAYS, await $.clock.now())
   await update($, boardView, () => b)
 }
 
@@ -849,6 +850,42 @@ function quotaPct(p: number): string {
   return `${p > 0 ? '+' : ''}${p.toFixed(1)}%`
 }
 
+const CHART_ROWS = 3
+/** Cells per day in a chart: a column and a gap. */
+const DAY_WIDTH = 4
+
+/** One feature's chart: its name and the window's figure, its columns, and the days under them. */
+function featureChart($: $, e: Parameters<$['ui']['resolve']>[0], label: string, f: { savedPct?: number; daily: readonly (number | undefined)[] }, starts: readonly number[], unit: 'pct' | 'count'): RenderElement {
+  const { Box, Text } = $.ui.resolve(e)
+  const daily = f.daily
+  const known = daily.filter((v): v is number => v !== undefined)
+  // The window's figure is the table's, so the two never disagree.
+  const total = unit === 'count' ? known.reduce((a, v) => a + v, 0) : f.savedPct
+  const figure = total === undefined || known.length === 0 ? 'measuring…' : unit === 'count' ? `${total} stops checked` : `${quotaPct(total)} over the ${starts.length} days`
+  const rows = columnChart(daily, CHART_ROWS)
+  const color = (v: number | undefined) => (v === undefined ? undefined : unit === 'count' ? 'cyan' : v >= 0 ? 'green' : 'yellow')
+  return (
+    <Box key={`chart-${label}`} marginTop={1} flexDirection="column">
+      <Text>
+        <Text>{label.padEnd(12)}</Text>
+        <Text bold color={known.length === 0 ? undefined : color(total)} dimColor={known.length === 0}>{figure}</Text>
+      </Text>
+      {rows.map((row, r) => (
+        <Text key={`row-${r}`}>
+          {[...row].map((ch, i) => (
+            <Text key={`c-${i}`} color={color(daily[i])} dimColor={daily[i] === undefined}>
+              {ch.repeat(DAY_WIDTH - 1)}{' '}
+            </Text>
+          ))}
+        </Text>
+      ))}
+      <Text dimColor>{starts.map(t => DAY_NAMES[new Date(t).getDay()]!.padEnd(DAY_WIDTH)).join('')}</Text>
+    </Box>
+  )
+}
+
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
 async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
   const { Box, Text, Button } = $.ui.resolve(e)
   const s = await read($, status)
@@ -868,6 +905,14 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         <Text dimColor>{s.provider ?? ''}</Text>
       </Box>
       {s.state === 'no_key' ? <Text color="yellow">Run /jev-setup (or press s) to add a key for Jev.</Text> : null}
+
+      {/* the options first: each feature on or off */}
+      <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
+        {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
+        {ready ? keys.map(key => <Button key={key === 'doneCheck' ? 'done' : key} hotkey={SWITCHES[key].hotkey} plain label={`${SWITCHES[key].label} ${isOn(key) ? 'off' : 'on'}`} onPress={() => toggle($, key)} />) : null}
+        {/* the terminal's pane has its own ✕ */}
+        {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
+      </Box>
 
       {/* the two figures that matter: what Jev cost, and what it saved */}
       <Box marginTop={1} flexDirection="column">
@@ -907,6 +952,17 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         })}
       </Box>
 
+      {/* a chart per feature: what it did each day of the window */}
+      {b ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text>
+            <Text bold>By day</Text>
+            <Text dimColor>  share of the weekly quota saved each day; the done check, stops checked</Text>
+          </Text>
+          {keys.map(key => featureChart($, e, SWITCHES[key].label, b.features[key], b.dayStarts, key === 'doneCheck' ? 'count' : 'pct'))}
+        </Box>
+      ) : null}
+
       {(b && b.pctPerUnit === undefined) || s.gateway ? (
         <Box marginTop={1} flexDirection="column">
         {b && b.pctPerUnit === undefined ? <Text dimColor>Savings show once a few turns have recorded the quota they used.</Text> : null}
@@ -914,12 +970,6 @@ async function drawPane($: $, e: Parameters<$['ui']['resolve']>[0]) {
         </Box>
       ) : null}
 
-      <Box marginTop={1} flexDirection="row" flexWrap="wrap" columnGap={2}>
-        {s.state === 'no_key' ? <Button key="setup" hotkey="s" plain variant="primary" label="set up" onPress={() => void $.command.run({ command: 'jev-setup', args: '' })} /> : null}
-        {ready ? keys.map(key => <Button key={key === 'doneCheck' ? 'done' : key} hotkey={SWITCHES[key].hotkey} plain label={`${SWITCHES[key].label} ${isOn(key) ? 'off' : 'on'}`} onPress={() => toggle($, key)} />) : null}
-        {/* the terminal's pane has its own ✕ */}
-        {e.surface !== 'terminal' ? <Button key="close" role="dismiss" plain label="close" onPress={() => $.ui.close({ id: PANE })} /> : null}
-      </Box>
     </Box>
   )
 }

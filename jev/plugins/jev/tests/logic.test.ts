@@ -7,7 +7,9 @@ import {
   PROVIDERS,
   TOOL_KEY,
   buildState,
+  board,
   cardFor,
+  columnChart,
   cleanPrompt,
   decide,
   decisionText,
@@ -305,5 +307,27 @@ describe('helpers', () => {
     expect(isGatewayOn('http://127.0.0.1:8794', 8794)).toBe(true)
     expect(isGatewayOn('http://127.0.0.1:8789', 8794)).toBe(false)
     expect(isGatewayOn(null, 8794)).toBe(false)
+  })
+})
+
+describe('the board by day', () => {
+  test('a column chart: scaled to the largest, zero a dot, nothing known a blank, a cost hanging below', () => {
+    expect(columnChart([0, 1, 2, undefined], 2)).toEqual(['  █ ', '·██ '])
+    expect(columnChart([2, -2], 2)).toEqual(['█ ', '█ ', ' █'])
+  })
+
+  test('each feature gets one value per day, the done check counting its stops', () => {
+    const day = 86_400_000
+    const now = new Date(2026, 9, 6, 12).getTime()
+    const turn = (at: number, done: boolean) => ({
+      type: 'turn' as const, v: 4 as const, at, session: 's', project: 'p', turnId: `t${at}`, prompt: 'x', arm: 'off' as const,
+      actual: { steps: 1, durationMs: 1000, reason: 'answer', tools: 0 },
+      ...(done ? { done: { verdict: 'ok' as const, pushed: false } } : {}),
+    })
+    const b = board([turn(now - 2 * day, true), turn(now, true), turn(now - 60_000, true)] as never, 7, now)
+    expect(b.dayStarts).toHaveLength(7)
+    expect(b.features.doneCheck.daily).toEqual([0, 0, 0, 0, 1, 0, 2])
+    // no quota recorded yet: nothing can be said of the savings
+    expect(b.features.hints.daily.every(v => v === undefined)).toBe(true)
   })
 })

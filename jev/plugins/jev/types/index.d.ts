@@ -33,7 +33,10 @@ export type JevBoard = {
   turns: number
   /** Weekly-quota percent per weighted token unit, learned from the account's own turns. */
   pctPerUnit?: number
-  features: Record<'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck', { savedPct?: number; detail: string }>
+  /** Local midnight of each day of the window, oldest first. */
+  dayStarts: number[]
+  /** Per feature: its share of the weekly quota saved, a few words, and one value per day (see FeatureStat). */
+  features: Record<'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck', { savedPct?: number; detail: string; daily: (number | undefined)[] }>
   usage: { asks: number; p50Ms?: number; usd: number; unpriced: number; failed: number }
 }
 

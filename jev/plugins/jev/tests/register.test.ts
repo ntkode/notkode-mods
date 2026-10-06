@@ -744,3 +744,21 @@ test('the board: each feature on or off with a key, saved in /config, and what i
   expect(await pane.find({ type: 'Button', key: 'effort', text: 'effort on' })).toBeDefined()
   await pane.unmount()
 })
+
+test('the board: the options first, then the figures, then a chart per feature by day', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  w.usage = { usd: 0, week: 10 }
+  await start($)
+  await plainTurn($, w, 'turn 0', 'turn-0')
+  const pane = await $.ui.mount({ plugin: 'jev', surface: 'terminal', component: 'Pane', requestId: 'jev', props: PANE_PROPS })
+  const texts = (await pane.findAll({})).map(n => n.text ?? '')
+  const firstButton = texts.findIndex(t => /^hints (on|off)$/.test(t))
+  const spent = texts.findIndex(t => /^Spent on Jev/.test(t))
+  const byDay = texts.findIndex(t => /^By day/.test(t))
+  expect(firstButton).toBeGreaterThan(-1)
+  expect(firstButton).toBeLessThan(spent)
+  expect(spent).toBeLessThan(byDay)
+  for (const label of ['hints', 'effort', 'skill gate', 'fresh start', 'done check']) expect(await pane.find({ text: new RegExp(`^${label}\\s+(measuring…|[+-<>].*days|\\d+ stops checked)$`) })).toBeDefined()
+  await pane.unmount()
+})

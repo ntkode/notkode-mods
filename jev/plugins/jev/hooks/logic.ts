@@ -797,7 +797,15 @@ export function turnUnits(u: NonNullable<TurnRecord['actual']['usage']>): number
 export type FeatureKey = 'hints' | 'effort' | 'skillGate' | 'freshStart' | 'doneCheck'
 
 /** What one feature did over the window: its share of the weekly quota saved (negative: it cost), and a few words. */
-export type FeatureStat = { savedPct?: number; detail: string }
+export type FeatureStat = {
+  savedPct?: number
+  detail: string
+  /**
+   * One value per day of the window, oldest first: the share of the weekly quota saved that day,
+   * or for the done check the stops it checked; undefined where nothing can be said yet.
+   */
+  daily: (number | undefined)[]
+}
 
 /** What the features saved together, as a share of the weekly quota; undefined while none has a figure yet. */
 export function totalSaved(features: Record<string, FeatureStat>): number | undefined {
@@ -805,8 +813,28 @@ export function totalSaved(features: Record<string, FeatureStat>): number | unde
   return figures.length > 0 ? figures.reduce((a, b) => a + b, 0) : undefined
 }
 
-export function board(records: readonly LogRecord[], days: number): JevBoard {
+/** Local midnight of each of the last `days` days, oldest first, the last being today's. */
+export function dayStarts(now: number, days: number): number[] {
+  const today = new Date(now)
+  today.setHours(0, 0, 0, 0)
+  return Array.from({ length: days }, (_, i) => {
+    const d = new Date(today)
+    d.setDate(d.getDate() - (days - 1 - i))
+    return d.getTime()
+  })
+}
+
+export function board(records: readonly LogRecord[], days: number, now = Math.max(0, ...records.map(r => r.at))): JevBoard {
   const turns = records.filter(r => r.type === 'turn' && r.v === 4)
+  const starts = dayStarts(now, days)
+  /** Which day of the window a turn falls on; -1 before it. */
+  const dayOf = (t: TurnRecord) => {
+    for (let i = starts.length - 1; i >= 0; i--) if (t.at >= starts[i]!) return i
+    return -1
+  }
+  /** `value` of each day's turns, oldest day first. */
+  const perDay = <T>(group: readonly TurnRecord[], value: (dayTurns: TurnRecord[]) => T): T[] =>
+    starts.map((_, i) => value(group.filter(t => dayOf(t) === i)))
   const metered = turns.filter(t => t.actual.usage)
   const units = (t: TurnRecord) => turnUnits(t.actual.usage!)
   const rated = metered.filter(t => t.actual.weekPct !== undefined)
@@ -818,6 +846,15 @@ export function board(records: readonly LogRecord[], days: number): JevBoard {
   /** Median turn with the feature vs median turn without it, times the turns with it. */
   const compare = (on: readonly TurnRecord[], off: readonly TurnRecord[]): number | undefined =>
     on.length >= MIN_GROUP && off.length >= MIN_GROUP ? (median(off.map(units)) - median(on.map(units))) * on.length : undefined
+  /** Each day's turns with the feature against the window's median turn without it. */
+  const compareDaily = (on: readonly TurnRecord[], off: readonly TurnRecord[], total: number | undefined): (number | undefined)[] =>
+    total === undefined || rate === undefined
+      ? starts.map(() => undefined)
+      : perDay(on, g => (g.length === 0 ? 0 : (median(off.map(units)) - median(g.map(units))) * g.length * rate))
+  const readSavedDaily = (key: 'skills' | 'fresh', any: boolean): (number | undefined)[] =>
+    !any || rate === undefined
+      ? starts.map(() => undefined)
+      : perDay(metered, g => g.reduce((s, t) => s + (t.saved?.[key] ?? 0) * t.actual.steps * UNIT_WEIGHTS.cacheRead, 0) * rate)
   const measuring = (on: number, off: number) => `measuring: ${Math.min(on, MIN_GROUP)}/${MIN_GROUP} with, ${Math.min(off, MIN_GROUP)}/${MIN_GROUP} control`
 
   const hint = metered.filter(t => t.arm === 'hint')
@@ -842,26 +879,31 @@ export function board(records: readonly LogRecord[], days: number): JevBoard {
 
   return {
     days,
+    dayStarts: starts,
     turns: turns.length,
     ...(rate !== undefined ? { pctPerUnit: rate } : {}),
     features: {
       hints: {
         ...(hintUnits !== undefined && rate !== undefined ? { savedPct: hintUnits * rate } : {}),
+        daily: compareDaily(hint, control, hintUnits),
         detail: hintUnits === undefined ? `${hinted} hints · ${measuring(hint.length, control.length)}` : `${hinted} hints in ${hint.length} turns, vs ${control.length} control turns`,
       },
       effort: {
         ...(effortUnits !== undefined && rate !== undefined ? { savedPct: effortUnits * rate } : {}),
+        daily: compareDaily(quickOn, quickOff, effortUnits),
         detail: effortUnits === undefined ? `${quickOn.length} quick questions at low effort · ${measuring(quickOn.length, quickOff.length)}` : `${quickOn.length} quick questions at low effort`,
       },
       skillGate: {
         ...(gated.length > 0 ? { savedPct: pctOf(readSaved('skills')) } : {}),
+        daily: readSavedDaily('skills', gated.length > 0),
         detail: gated.length > 0 ? `${tokens(lastGate ?? 0)} fewer tokens on every request` : 'no gated session yet',
       },
       freshStart: {
         ...(freshTurns.length > 0 ? { savedPct: pctOf(readSaved('fresh')) } : {}),
+        daily: readSavedDaily('fresh', freshTurns.length > 0),
         detail: `${freshTurns.length} fresh starts`,
       },
-      doneCheck: { detail: `${done.length} stops checked · ${pushed} broken promises` },
+      doneCheck: { daily: perDay(done, g => g.length), detail: `${done.length} stops checked · ${pushed} broken promises` },
     },
     usage: {
       asks: asked,
@@ -923,6 +965,42 @@ export function toolCounts(picks: readonly string[]): string {
     .sort((a, b) => b[1] - a[1])
     .map(([t, n]) => (n > 1 ? `${t} ×${n}` : t))
     .join(' · ')
+}
+
+const EIGHTHS = ' ▁▂▃▄▅▆▇█'
+
+/**
+ * A column chart as text, one character per value per row, rows top first. With only values of
+ * zero or more it is `rows` tall; with a negative one, `rows` above a zero line and `rows - 1` below
+ * it, on one scale, a negative value hanging down. Zero is a dot on the base line, a value that
+ * rounds to nothing a sliver, an undefined one a blank. Callers color by sign.
+ */
+export function columnChart(values: readonly (number | undefined)[], rows: number): string[] {
+  const hasNegative = values.some(v => v !== undefined && v < 0)
+  const below = hasNegative ? Math.max(1, rows - 1) : 0
+  const max = Math.max(0, ...values.map(v => Math.abs(v ?? 0)))
+  const eighths = (v: number, of: number) => (max === 0 ? 0 : Math.max(1, Math.round((Math.abs(v) / max) * of * 8)))
+  const up = Array.from({ length: rows }, (_, r) => {
+    const level = rows - 1 - r
+    return values
+      .map(v => {
+        if (v === undefined) return ' '
+        if (v === 0) return level === 0 ? '·' : ' '
+        if (v < 0) return ' '
+        return EIGHTHS[Math.max(0, Math.min(8, eighths(v, rows) - level * 8))]!
+      })
+      .join('')
+  })
+  const down = Array.from({ length: below }, (_, level) =>
+    values
+      .map(v => {
+        if (v === undefined || v >= 0) return ' '
+        const fill = eighths(v, rows) - level * 8
+        return fill >= 8 ? '█' : fill >= 4 ? '▀' : fill >= 1 ? '▔' : ' '
+      })
+      .join(''),
+  )
+  return [...up, ...down]
 }
 
 /** `55s`, `5m 17s`. */
