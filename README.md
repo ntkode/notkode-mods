@@ -15,6 +15,7 @@ Update the list with `/plugin marketplace update notkode-mods`.
 |---|---|---|
 | `jev` | Jev, TypeSafe's fast decision model, picks the tool that fits Claude's next step, and Claude gets it as a hint. Shown live above the prompt, measured against a control group of turns without Jev. After installing, run `/jev-setup`. | [`jev/`](jev/) |
 | `files` | A file browser pane: walk the project, read Markdown rendered, see pictures in the terminal, and the files Claude touched this session. Open it with `/files`. | [`files/`](files/) |
+| `hig` | Apple's Human Interface Guidelines inside Claude Code: Claude designs with them, each UI edit is checked against them, and an audit pane shows which guidelines your app covers and which are still gaps, with a button to have Claude fix them. Open it with `/hig`. | [`hig/`](hig/) |
 
 ## Adding a plugin
 

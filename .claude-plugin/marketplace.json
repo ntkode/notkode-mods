@@ -19,6 +19,13 @@
       "source": "./files/plugins/files",
       "category": "productivity",
       "keywords": ["files", "file-browser", "markdown", "images", "mod"]
+    },
+    {
+      "name": "hig",
+      "description": "Apple's Human Interface Guidelines inside Claude Code: Claude designs with them, each UI edit is checked, and an audit pane shows the guidelines your app covers and the gaps left, with fixes one press away",
+      "source": "./hig/plugins/hig",
+      "category": "development",
+      "keywords": ["hig", "human-interface-guidelines", "apple", "design", "accessibility", "audit", "mod"]
     }
   ]
 }

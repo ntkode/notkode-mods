@@ -1,0 +1,29 @@
+{
+  "name": "hig",
+  "version": "0.1.0",
+  "description": "Apple's Human Interface Guidelines inside Claude Code: Claude works with them in mind, each edit is checked against them, and an audit pane shows which guidelines your app covers and which it does not yet.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Matheus Tonelotto"
+  },
+  "homepage": "https://github.com/ntkode/notkode-mods/tree/main/hig",
+  "repository": "https://github.com/ntkode/notkode-mods",
+  "license": "MIT",
+  "keywords": ["hig", "human-interface-guidelines", "apple", "design", "accessibility", "audit", "mod"],
+  "userConfig": {
+    "guide": {
+      "type": "string",
+      "title": "HIG: guide Claude",
+      "description": "on: in an app project, Claude's system prompt carries the guidelines that apply to it. off: Claude is not told.",
+      "options": ["on", "off"],
+      "default": "on"
+    },
+    "editCheck": {
+      "type": "string",
+      "title": "HIG: check each edit",
+      "description": "on: after Claude writes or edits a UI file, the guidelines that edit breaks reach Claude with the lines and links. off: only the audit pane.",
+      "options": ["on", "off"],
+      "default": "on"
+    }
+  }
+}
