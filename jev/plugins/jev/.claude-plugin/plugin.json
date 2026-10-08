@@ -1,6 +1,6 @@
 {
   "name": "jev",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Jev picks the tool that fits Claude's next step and Claude gets it as a hint, shown live and measured against a control group. Native to Claude Code: no gateway, no proxy.",
   "author": {
     "name": "Matheus Tonelotto"

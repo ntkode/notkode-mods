@@ -14,6 +14,9 @@ import {
   DONE_NUDGE,
   JEV_TIMEOUT_MS as ASK_TIMEOUT_MS,
   LOW_EFFORT_STEPS,
+  MAX_ASKS_PER_TURN,
+  REFUSED_PAUSE_MS,
+  REFUSED_STATUSES,
   TOPIC_MIN_TOKENS,
   TRIAGE_QUESTIONS,
   approxTokens,
@@ -57,6 +60,7 @@ import {
   skipReason,
   tally,
   tokens,
+  reachableTools,
   toolCounts,
   toolQuestions,
   turnsFrom,
@@ -150,6 +154,8 @@ let project = ''
 let logPath = ''
 let excluded = false
 let access: JevAccess | undefined
+/** The provider refused this key (no credits, a revoked key): Jev rests until `until`. */
+let refused: { key: string; status: number; until: number } | undefined
 
 const turns = new Map<string, Turn>()
 let current: string | undefined
@@ -300,6 +306,9 @@ function armFor(paused: boolean): Turn['arm'] {
 
 /** One call to Jev, retried once on a busy or failing server; throws with the status on a refusal. */
 async function askJev($: $, a: JevAccess, state: JevState, questions: Record<string, Question>, spend?: Spend): Promise<Record<string, Answer>> {
+  const label = PROVIDERS[a.provider].label
+  if (refused && refused.key === a.key && (await $.clock.now()) < refused.until)
+    throw Object.assign(new Error(`HTTP ${refused.status} from ${label}, resting`), { status: refused.status })
   const init = {
     method: 'POST',
     headers: {
@@ -325,16 +334,31 @@ async function askJev($: $, a: JevAccess, state: JevState, questions: Record<str
       }
       return normalizeAnswers(body.answers)
     }
-    if (attempt > 0 || !RETRYABLE.has(res.status)) throw Object.assign(new Error(`HTTP ${res.status} from ${PROVIDERS[a.provider].label}`), { status: res.status })
+    if (REFUSED_STATUSES.has(res.status)) await refuse($, a, res.status)
+    if (attempt > 0 || !RETRYABLE.has(res.status)) throw Object.assign(new Error(`HTTP ${res.status} from ${label}`), { status: res.status })
     await $.clock.sleep(100)
   }
+}
+
+/** Rests Jev after the provider refused the key or wanted payment, and says so once per key. */
+async function refuse($: $, a: JevAccess, status: number): Promise<void> {
+  const known = refused?.key === a.key
+  refused = { key: a.key, status, until: (await $.clock.now()) + REFUSED_PAUSE_MS }
+  if (known) return
+  const why = status === 402 ? 'wants payment (out of credits?)' : 'refused the key'
+  $.ui.toast(`Jev: ${PROVIDERS[a.provider].label} ${why}, HTTP ${status}. Jev rests ${REFUSED_PAUSE_MS / 60_000} min; /jev-setup to fix it.`)
+}
+
+/** Whether Jev is resting after a refusal: asks are skipped, not counted as failures. */
+async function resting($: $): Promise<boolean> {
+  return refused !== undefined && refused.key === access?.key && (await $.clock.now()) < refused.until
 }
 
 /** What Jev makes of Claude's next request: the tools, the conversation, then jev-gateway's rule. */
 async function nextDecision($: $, rows: readonly MessageRow[], results: Readonly<Record<string, string>>, spend: Spend): Promise<Decision> {
   const a = access
   if (!a) return { mode: 'pass', reason: 'jev_error: no key' }
-  const tools: Tool[] = (await $.tool.list()).map(t => ({ name: t.name, description: t.description }))
+  const tools = reachableTools((await $.tool.list()).map(t => ({ name: t.name, description: t.description, mcp: t.mcp })), rows)
   const conversation = turnsFrom(rows, results)
   const skip = skipReason(tools, conversation)
   if (skip) return { mode: 'pass', reason: skip }
@@ -362,6 +386,7 @@ async function conversationRows($: $): Promise<MessageRow[]> {
  * Never throws: Jev failing or running out of time is a pass, and the request goes on without a hint.
  */
 async function consult($: $, jev: JevTurn, arm: JevArm, rows: readonly MessageRow[], results: Readonly<Record<string, string>> = {}): Promise<Decision> {
+  if (await resting($)) return { mode: 'pass', reason: 'jev_refused' }
   const started = await $.clock.now()
   await update($, phase, () => ({ name: 'asking', at: started, arm }))
   animate($)
@@ -1080,8 +1105,8 @@ async function setUpKey($: $): Promise<{ text: string; ok: boolean }> {
     checked = await checkKey($, accessWith(model))
   }
   if (!checked.ok) {
-    const refused = checked.status === 401 || checked.status === 403
-    return { ok: false, text: `Jev setup stopped: ${refused ? `${p.label} refused that key` : 'the key check failed'} (${checked.reason ?? 'no answer'}). Nothing was saved.` }
+    const rejected = checked.status === 401 || checked.status === 403
+    return { ok: false, text: `Jev setup stopped: ${rejected ? `${p.label} refused that key` : 'the key check failed'} (${checked.reason ?? 'no answer'}). Nothing was saved.` }
   }
   await saveKey($, id, clip.text, model)
   await $.process.run(clip.clear, { stdin: '', timeoutMs: 5000 }).catch(() => undefined)
@@ -1091,6 +1116,8 @@ async function setUpKey($: $): Promise<{ text: string; ok: boolean }> {
 async function setup($: $, cwd: string): Promise<string> {
   if (mode === 'off') return 'Jev is off: set "Jev: hints" to on or shadow in /config first.'
   if (excluded) return 'This repo is in the excluded list (/config, "Jev: excluded repos"), so Jev is never asked here.'
+  // Setting up is how a refused key gets fixed (credits added, a new key): try Jev again.
+  refused = undefined
   const lines: string[] = []
   const existing = await loadAccess($)
   const keep = existing ? await ask($, `A key for Jev is already set up (${PROVIDERS[existing.provider].label}). Keep it?`, ['Keep it', 'Set a new key']) : 'Set a new key'
@@ -1247,6 +1274,7 @@ export const register: Register = (on, options) => {
     if (calls < 0 || mine < calls || turn.step !== step) return result
     turn.step = undefined
     if (turn.arm !== 'hint' && turn.arm !== 'shadow') return result
+    if (turn.jev.asked >= MAX_ASKS_PER_TURN) return result
     const d = await consult($, turn.jev, turn.arm, await conversationRows($), step.results)
     if (d.mode !== 'hint' || !d.tool) return result
     turn.pending = d.tool

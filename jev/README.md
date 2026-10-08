@@ -114,6 +114,10 @@ Options are stored per install: a marketplace install (`jev@notkode-mods`) and a
 ## Good to know
 
 - **The main conversation only.** Subagents run without hints.
+- **At most 8 asks per turn.** The prompt's, then after the first 7 batches of tool results; a long
+  turn goes on without hints after that, so it does not send Jev the conversation before every request.
+- **Out of credits, or a refused key, rests Jev.** On HTTP 401, 402 or 403 the plugin says so once and
+  stops calling Jev for 15 minutes (until then, the turn goes on without it). `/jev-setup` ends the rest.
 - **Hints stay in the conversation.** A hint is saved with the prompt or the tool result it rode
   on, so later requests see old hints too (about 30 to 40 tokens each).
 - **Coming from v0.4?** A session the old version had routed through its gateway on port 8794 is

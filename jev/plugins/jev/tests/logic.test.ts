@@ -7,6 +7,7 @@ import {
   PROVIDERS,
   TOOL_KEY,
   buildState,
+  reachableTools,
   board,
   newTrail,
   noteCall,
@@ -132,6 +133,33 @@ describe('what Jev reads', () => {
     expect(state.conversation.at(-1)).toEqual(turns.at(-1))
     expect(state.conversation.length + state.earlier_turns_omitted!).toBe(40)
     expect(truncate('abcdefghij'.repeat(10), 40)).toContain('…[truncated]…')
+  })
+
+  test("the person's latest message stays, however much work came after it", () => {
+    const big = 'x'.repeat(3_900)
+    const work = Array.from({ length: 30 }, (_, i) => ({ role: 'tool_result' as const, tool: 'Bash', content: `${i}${big}` }))
+    const turns = [{ role: 'user' as const, text: 'earlier' }, { role: 'user' as const, text: 'fix every test' }, ...work]
+    const state = buildState(turns)
+    expect(state.conversation[0]).toEqual({ role: 'user', text: 'fix every test' })
+    expect(state.conversation.at(-1)).toEqual(work.at(-1))
+    expect(JSON.stringify(state.conversation).length).toBeLessThan(15_000)
+    expect(state.conversation.length + state.earlier_turns_omitted!).toBe(turns.length)
+  })
+
+  test('with tool search on, MCP tools the conversation never named are left out; without it, all stay', () => {
+    const tools = [
+      { name: 'Bash', description: 'Runs a command.', mcp: false },
+      { name: 'ToolSearch', description: 'Loads deferred tools.', mcp: false },
+      { name: 'mcp__a__used', description: 'Used.', mcp: true },
+      { name: 'mcp__a__found', description: 'Found by a search.', mcp: true },
+      { name: 'mcp__a__never', description: 'Never named.', mcp: true },
+    ]
+    const rows = [
+      { role: 'assistant' as const, text: '', toolUses: [{ tool_use_id: '1', tool: 'mcp__a__used', input: {} }] },
+      { role: 'assistant' as const, text: '', toolUses: [{ tool_use_id: '2', tool: 'ToolSearch', input: { query: 'select:mcp__a__found' } }] },
+    ]
+    expect(reachableTools(tools, rows).map(t => t.name)).toEqual(['Bash', 'ToolSearch', 'mcp__a__used', 'mcp__a__found'])
+    expect(reachableTools(tools.filter(t => t.name !== 'ToolSearch'), rows)).toHaveLength(4)
   })
 })
 

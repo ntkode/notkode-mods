@@ -25,6 +25,15 @@ const PROVIDER_IDS = Object.keys(PROVIDERS) as Provider[]
 export const JEV_TIMEOUT_MS = 4000
 /** Jev must be at least this sure before Claude gets a hint (jev-gateway's default). */
 export const MIN_CONFIDENCE = 0.7
+/**
+ * At most this many hint asks per turn: the prompt's, then after each batch of tool results. A long
+ * turn would otherwise send Jev the conversation before every request (132 asks in one turn).
+ */
+export const MAX_ASKS_PER_TURN = 8
+/** Statuses that mean the provider refuses the key or wants payment: asking again cannot help. */
+export const REFUSED_STATUSES: ReadonlySet<number> = new Set([401, 402, 403])
+/** How long Jev rests after such a refusal before it is tried again. /jev-setup ends the rest. */
+export const REFUSED_PAUSE_MS = 15 * 60_000
 
 /** The variables of a `.env` file (`NAME=value`, `export` and quotes allowed). */
 export function parseEnvFile(text: string): Record<string, string> {
@@ -98,7 +107,8 @@ export type MessageRow = {
   toolUses: readonly { tool_use_id: string; tool: string; input: unknown; text?: string }[]
 }
 
-export const MAX_STATE_CHARS = 60_000
+/** The most conversation one call sends Jev: the newest turns, about 15k characters (4k tokens). */
+export const MAX_STATE_CHARS = 15_000
 export const MAX_MESSAGE_CHARS = 4_000
 
 /** Keeps the head and tail of long text; the middle matters least for picking a tool. */
@@ -129,14 +139,26 @@ export function turnsFrom(rows: readonly MessageRow[], results: Readonly<Record<
   return turns
 }
 
-/** The newest turns that fit the budget, after the system prompt's head and tail. */
-export function buildState(turns: readonly StateTurn[], system?: string): JevState {
+/**
+ * The newest turns that fit the budget, after the system prompt's head and tail. The person's
+ * latest message always comes first: every question is about it, however long the work since.
+ */
+export function buildState(turns: readonly StateTurn[], system?: string, maxChars = MAX_STATE_CHARS): JevState {
   const instructions = system ? truncate(system, MAX_MESSAGE_CHARS) : ''
-  let budget = MAX_STATE_CHARS - instructions.length
+  const asked = turns.findLastIndex(t => t.role === 'user')
+  let budget = maxChars - instructions.length - (asked >= 0 ? JSON.stringify(turns[asked]).length : 0)
   const conversation: StateTurn[] = []
-  for (let i = turns.length - 1; i >= 0; i--) {
+  let i = turns.length - 1
+  for (; i > asked; i--) {
     budget -= JSON.stringify(turns[i]).length
     if (budget < 0 && conversation.length > 0) break
+    conversation.unshift(turns[i]!)
+  }
+  if (asked >= 0) conversation.unshift(turns[asked]!)
+  // Room left after the latest message: the turns before it.
+  if (i === asked) for (i = asked - 1; i >= 0; i--) {
+    budget -= JSON.stringify(turns[i]).length
+    if (budget < 0) break
     conversation.unshift(turns[i]!)
   }
   const omitted = turns.length - conversation.length
@@ -145,7 +167,18 @@ export function buildState(turns: readonly StateTurn[], system?: string): JevSta
 
 // ---------------------------------------------------------------- what Jev is asked
 
-export type Tool = { name: string; description: string }
+export type Tool = { name: string; description: string; mcp?: boolean }
+
+/**
+ * The tools Claude can call on its next request. With tool search on, an MCP tool is deferred
+ * until Claude loads it, so one the conversation never names (called, or found by a search) is
+ * out of reach: Claude would call ToolSearch first, which stays on the list.
+ */
+export function reachableTools(tools: readonly Tool[], rows: readonly MessageRow[]): Tool[] {
+  if (!tools.some(t => t.name === 'ToolSearch')) return [...tools]
+  const named = rows.map(r => `${r.text}\n${r.toolUses.map(u => `${u.tool} ${JSON.stringify(u.input ?? {})} ${u.text ?? ''}`).join('\n')}`).join('\n')
+  return tools.filter(t => !t.mcp || named.includes(t.name))
+}
 
 export const NO_TOOL = 'no_tool_needed'
 const NONE_OF_THESE = 'none_of_these'
@@ -154,7 +187,8 @@ export const NEEDS_TOOL_KEY = 'needs_tool'
 /** Most tools one question may offer; a bigger roster is shortlisted first. */
 export const MAX_TOOLS = 120
 const SHORTLIST_PER_SHARD = 3
-const MAX_DESCRIPTION_CHARS = 1024
+/** A name and a sentence or two are enough to pick a tool by. */
+const MAX_DESCRIPTION_CHARS = 300
 const QUESTION_CHAR_BUDGET = 48_000
 /** A tool name goes into text the model reads, so it must stay one inert token. */
 const SAFE_TOOL_NAME = /^[\p{L}\p{N}_.:/-]{1,128}$/u
@@ -278,6 +312,7 @@ export const REASON_TEXT: Record<string, string> = {
   jev_unexpected_answer: 'unexpected Jev answer',
   jev_error: 'Jev failed',
   jev_timeout: 'Jev too slow',
+  jev_refused: 'the provider refused Jev',
   too_many_tools: 'too many tools',
   unsafe_tool_name: 'a tool name it cannot use',
   duplicate_tool_names: 'duplicate tool names',

@@ -380,6 +380,42 @@ test('Jev failing: the request goes on without a hint, counted as a failure', HI
   expect(logged(w)[0]).toMatchObject({ arm: 'hint', jev: { asked: 1, hinted: 0, reasons: { jev_error: 1 }, cards: ['fail'] } })
 })
 
+test('out of credits: Jev rests after a 402, says so once, and is tried again after the rest', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.jev.push({ status: 402 })
+  await plainTurn($, w, 'hello')
+  expect(w.asks).toHaveLength(1)
+  expect(w.toasts.filter(t => t.includes('HTTP 402'))).toHaveLength(1)
+  // resting: Jev is not called, and the skipped ask is not a failure
+  await plainTurn($, w, 'and now?', 'turn-2')
+  expect(w.asks).toHaveLength(1)
+  expect(logged(w)[1].jev?.reasons?.jev_error).toBeUndefined()
+  await clock.advance(15 * 60_000)
+  await plainTurn($, w, 'and now?', 'turn-3')
+  expect(w.asks).toHaveLength(2)
+  expect(logged(w)[2].jev).toMatchObject({ asked: 1, hinted: 1 })
+})
+
+test('a long turn asks Jev at most 8 times: the prompt, then 7 batches of tool results', HINTS, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  const w = world(on, clock)
+  await start($)
+  w.messages = () => [{ role: 'user', text: 'fix every test', toolUses: [] }]
+  await submit($, 'fix every test')
+  await $.turn.start({ text: 'fix every test', turnId: 'turn-1' })
+  for (let i = 0; i < 12; i++) {
+    w.responses.push([{ name: 'Read', input: { file_path: 'x.ts' } }])
+    await step($, 'turn-1', i)
+    await $.tool.call({ tool: 'Read', file_path: 'x.ts' })
+  }
+  await step($, 'turn-1', 12)
+  await complete($, w, 'turn-1')
+  expect(w.asks).toHaveLength(8)
+  expect(logged(w)[0]).toMatchObject({ actual: { steps: 13, tools: 12 }, jev: { asked: 8 } })
+})
+
 test('a control turn: Jev sits it out, the owl sleeps, and the band says why', { options: { controlPercent: 100 } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   const w = world(on, clock)
